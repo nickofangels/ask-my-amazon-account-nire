@@ -1,0 +1,62 @@
+---
+description: Core behavior rules for writing Amazon SP-API scripts in this project
+alwaysApply: true
+---
+
+# SP-API Script Behavior
+
+## Auth — always import, never rewrite
+
+```python
+from auth import CREDENTIALS, MARKETPLACE
+from sp_api.api import Orders  # or Reports, Catalog, etc.
+
+client = Orders(credentials=CREDENTIALS, marketplace=MARKETPLACE)
+```
+
+Never inline credentials. Never re-implement OAuth. Always import from `auth.py`.
+
+## Data directories — always create before writing
+
+```python
+import os
+os.makedirs('data/orders', exist_ok=True)
+```
+
+Use the correct subfolder for the data type:
+- `data/orders/` — Orders API responses
+- `data/inventory/` — Inventory API responses
+- `data/reports/` — Downloaded report files
+
+## Filename format — always include a timestamp
+
+```python
+from datetime import datetime
+timestamp = datetime.now().strftime('%Y-%m-%dT%H%M%S')
+filename = f"data/orders/orders_{timestamp}.json"
+```
+
+## Rate limits — retry with exponential backoff
+
+```python
+import time
+
+def call_with_backoff(fn, retries=5):
+    for attempt in range(retries):
+        try:
+            return fn()
+        except Exception as e:
+            if '429' in str(e) or 'QuotaExceeded' in str(e):
+                wait = 2 ** attempt
+                print(f"Rate limited. Retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                raise
+    raise RuntimeError("Max retries exceeded")
+```
+
+## Before writing any script
+
+1. Determine if the question requires a **direct API call** (orders, inventory, listings — returns immediately) or a **report** (sales summaries, fees, settlements — async flow).
+2. Write the appropriate script based on that determination.
+3. Run it, save the output, then answer from the saved file.

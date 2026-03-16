@@ -1,0 +1,74 @@
+---
+description: Async report flow for Amazon SP-API report-based data pulls
+alwaysApply: true
+---
+
+# SP-API Async Report Flow
+
+Use this pattern for sales summaries, fee reports, settlement data, and any other report-type data. These are **not** direct API calls — they require request → poll → download.
+
+## When to use reports vs. direct calls
+
+| Use direct API call | Use report flow |
+|---|---|
+| Order details, status, items | Sales summary by date range |
+| Inventory levels | Fee breakdown, settlement |
+| Listing/catalog data | FBA reimbursements |
+| Customer feedback | Business report metrics |
+
+## Full pattern
+
+```python
+import time
+import os
+from datetime import datetime
+from auth import CREDENTIALS, MARKETPLACE
+from sp_api.api import Reports
+
+os.makedirs('data/reports', exist_ok=True)
+
+reports_client = Reports(credentials=CREDENTIALS, marketplace=MARKETPLACE)
+
+# 1. Request the report
+response = reports_client.create_report(
+    reportType='GET_FLAT_FILE_ALL_ORDERS_DATA_BY_ORDER_DATE_GENERAL',
+    dataStartTime='2026-01-01T00:00:00Z',
+    dataEndTime='2026-01-31T23:59:59Z',
+)
+report_id = response.payload['reportId']
+print(f"Report requested: {report_id}")
+
+# 2. Poll until DONE (timeout after 10 minutes)
+timeout = 600
+start = time.time()
+while True:
+    if time.time() - start > timeout:
+        raise TimeoutError("Report did not complete within 10 minutes")
+    status_resp = reports_client.get_report(reportId=report_id)
+    status = status_resp.payload['processingStatus']
+    print(f"Status: {status}")
+    if status == 'DONE':
+        document_id = status_resp.payload['reportDocumentId']
+        break
+    if status in ('FATAL', 'CANCELLED'):
+        raise RuntimeError(f"Report failed with status: {status}")
+    time.sleep(30)
+
+# 3. Download the document
+doc_resp = reports_client.get_report_document(reportDocumentId=document_id)
+content = doc_resp.payload  # already decompressed by the library
+
+# 4. Save locally with timestamp
+timestamp = datetime.now().strftime('%Y-%m-%dT%H%M%S')
+filename = f"data/reports/report_{timestamp}.json"
+with open(filename, 'w') as f:
+    import json
+    json.dump(content, f, indent=2)
+
+print(f"Saved to {filename}")
+```
+
+## Key constraints
+- Always sleep **30 seconds** between poll attempts
+- Always set a **10-minute timeout** on the poll loop
+- Always save the raw download before parsing — answer from the saved file

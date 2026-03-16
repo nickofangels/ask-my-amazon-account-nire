@@ -1,0 +1,21 @@
+# Credentials — never commit
+.env
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Raw data files accumulate in /data but are excluded from git
+data/**/*.json
+data/**/*.csv
+data/**/*.tsv
+data/**/*.txt
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.DS_Store
