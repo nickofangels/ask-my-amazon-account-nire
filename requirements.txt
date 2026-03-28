@@ -1,2 +1,4 @@
 python-amazon-sp-api
 python-dotenv
+psycopg2-binary
+httpx

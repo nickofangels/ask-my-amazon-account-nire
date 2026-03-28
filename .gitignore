@@ -11,6 +11,7 @@ data/**/*.json
 data/**/*.csv
 data/**/*.tsv
 data/**/*.txt
+data/amazon.db
 
 # Python artifacts
 __pycache__/

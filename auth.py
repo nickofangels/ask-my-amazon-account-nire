@@ -1,4 +1,5 @@
 from dotenv import load_dotenv
+from sp_api.base import Marketplaces as _Marketplaces
 import os
 
 load_dotenv()
@@ -9,7 +10,15 @@ CREDENTIALS = {
     'lwa_client_secret': os.getenv('SP_API_CLIENT_SECRET'),
 }
 
-MARKETPLACE = os.getenv('SP_API_MARKETPLACE_ID', 'ATVPDKIKX0DER')
+_marketplace_id = (
+    os.getenv('SP_API_MARKETPLACE_ID')
+    or os.getenv('SP_API_MARKETPLACE_ID_US')
+    or 'ATVPDKIKX0DER'
+)
+MARKETPLACE = next(
+    (m for m in _Marketplaces if m.marketplace_id == _marketplace_id),
+    _Marketplaces.US,
+)
 
 # ------------------------------------------------------------------
 # Usage in any script:

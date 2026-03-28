@@ -1,0 +1,48 @@
+---
+description: Data storage conventions — all report data goes into SQLite
+alwaysApply: true
+---
+
+# Data Storage
+
+All downloaded report data is stored in **SQLite** at `data/amazon.db`.
+
+## Never save raw JSON files as the final output
+
+After downloading a report, insert into the database — don't write a standalone `.json` file.
+
+## Standard pattern
+
+```python
+import sqlite3
+
+DB_PATH = 'data/amazon.db'
+
+with sqlite3.connect(DB_PATH) as conn:
+    conn.execute('''CREATE TABLE IF NOT EXISTS sqp_report (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        marketplace TEXT,
+        asin TEXT,
+        start_date TEXT,
+        end_date TEXT,
+        search_query TEXT,
+        search_query_score INTEGER,
+        search_query_volume INTEGER,
+        total_impressions INTEGER,
+        asin_impressions INTEGER,
+        asin_impression_share REAL,
+        total_clicks INTEGER,
+        asin_clicks INTEGER,
+        asin_click_share REAL,
+        total_cart_adds INTEGER,
+        asin_cart_adds INTEGER,
+        total_purchases INTEGER,
+        asin_purchases INTEGER,
+        downloaded_at TEXT
+    )''')
+    conn.executemany('INSERT INTO sqp_report (...) VALUES (...)', rows)
+```
+
+## Database location
+
+`data/amazon.db` — committed to `.gitignore`, never to source control.
