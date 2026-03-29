@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Amazon DB Build Plan — Flowchart</title>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #0f0f13;
+      color: #e8e8f0;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 48px 24px;
+    }
+
+    header {
+      text-align: center;
+      margin-bottom: 48px;
+    }
+
+    header h1 {
+      font-size: 1.75rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      color: #ffffff;
+    }
+
+    header p {
+      margin-top: 8px;
+      color: #8888aa;
+      font-size: 0.95rem;
+    }
+
+    .diagram-wrapper {
+      background: #16161e;
+      border: 1px solid #2a2a3a;
+      border-radius: 16px;
+      padding: 40px 32px;
+      max-width: 1100px;
+      width: 100%;
+      overflow-x: auto;
+    }
+
+    .mermaid {
+      display: flex;
+      justify-content: center;
+    }
+
+    .legend {
+      margin-top: 48px;
+      max-width: 1100px;
+      width: 100%;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 16px;
+    }
+
+    .legend-card {
+      background: #16161e;
+      border: 1px solid #2a2a3a;
+      border-radius: 12px;
+      padding: 20px;
+    }
+
+    .legend-card .phase {
+      font-size: 0.7rem;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      margin-bottom: 6px;
+    }
+
+    .legend-card h3 {
+      font-size: 1rem;
+      font-weight: 600;
+      color: #ffffff;
+      margin-bottom: 8px;
+    }
+
+    .legend-card p {
+      font-size: 0.85rem;
+      color: #8888aa;
+      line-height: 1.6;
+    }
+
+    .phase-discover { color: #7c9eff; }
+    .phase-validate { color: #f9c74f; }
+    .phase-design   { color: #90e0a0; }
+    .phase-infra    { color: #f4845f; }
+    .phase-execute  { color: #c084fc; }
+  </style>
+</head>
+<body>
+
+  <header>
+    <h1>Amazon Business DB — Build Plan</h1>
+    <p>Systemic thinking: discover → validate → design → pivot → execute</p>
+  </header>
+
+  <div class="diagram-wrapper">
+    <div class="mermaid">
+flowchart TD
+    A([What data does my Amazon account have?]):::start --> B
+
+    B["🔍 Research all SP-API reports\nfor sales + optimization\n(Brand Analytics, Orders, FBA, Promos…)"]:::discover
+
+    B --> C{"Too many overlapping reports.\nWhich ones do I actually have access to?"}:::decision
+
+    C --> D["⚡ probe_reports.py\nFire create_report for each candidate\nRead immediate response — no polling"]:::discover
+
+    D --> E[("✅ Probe result\n12 / 13 accessible\n1 blocked — settlements")]:::result
+
+    E --> F["📅 Scope the backfill\n• Monthly granularity\n• 2-year max lookback\n• 18-month OK for some BA reports"]:::design
+
+    F --> G{"How to store?\nNo duplicate columns.\nPick best source per metric."}:::decision
+
+    G --> tables
+
+    subgraph tables["10 Normalized Tables — one authoritative source each"]
+        direction LR
+        T1["sales_and_traffic\nrevenue · sessions · CVR · buy box"]:::table
+        T2["orders\norder-level · geo · fulfillment"]:::table
+        T3["sqp_report\nper-query per-ASIN search funnel"]:::table
+        T4["search_catalog_performance\ncatalog-wide funnel per ASIN"]:::table
+        T5["search_terms\nmarketplace keyword intelligence"]:::table
+        T6["market_basket\ncross-sell / bundle signals"]:::table
+        T7["repeat_purchase\nLTV / retention per ASIN"]:::table
+        T8["promotions\npromo revenue lift"]:::table
+        T9["coupons\nclip + redemption rate"]:::table
+        T10["returns\nreturn reason + qty per ASIN"]:::table
+    end
+
+    tables --> I{"Where does the DB live?\nSQLite won't travel\nto another machine."}:::decision
+
+    I -->|"SQLite = local only"| J["☁️ Pivot: Supabase / PostgreSQL\nFree tier · accessible anywhere\nWeb UI to browse data"]:::infra
+
+    J --> K["schema.py\nCREATE TABLE IF NOT EXISTS × 10\nINSERT … ON CONFLICT DO NOTHING\nIdempotent backfills"]:::execute
+
+    K --> L["backfill.py\nLoop months → today back 2 years\nPoll until DONE per report\nInsert into Supabase"]:::execute
+
+    L --> M["🧪 Validate\n1-month test run first\nCheck row counts + spot-check values"]:::execute
+
+    M --> N([🎉 Full 2-year backfill\nStructured Amazon business DB\nQueryable from any machine]):::end_node
+
+    classDef start      fill:#1a1a2e,stroke:#7c9eff,stroke-width:2px,color:#c0d0ff
+    classDef discover   fill:#1a1f35,stroke:#7c9eff,stroke-width:1px,color:#c8d8ff
+    classDef decision   fill:#1f1a10,stroke:#f9c74f,stroke-width:1.5px,color:#fde9a0
+    classDef result     fill:#101f15,stroke:#90e0a0,stroke-width:2px,color:#c0f0cc
+    classDef design     fill:#131f13,stroke:#90e0a0,stroke-width:1px,color:#c0f0cc
+    classDef table      fill:#12181f,stroke:#4a7fa0,stroke-width:1px,color:#aad4f0,font-size:12px
+    classDef infra      fill:#201510,stroke:#f4845f,stroke-width:1.5px,color:#ffd0bc
+    classDef execute    fill:#1a1025,stroke:#c084fc,stroke-width:1px,color:#e0c8ff
+    classDef end_node   fill:#1a1025,stroke:#c084fc,stroke-width:2px,color:#e0c8ff
+    </div>
+  </div>
+
+  <div class="legend">
+    <div class="legend-card">
+      <div class="phase phase-discover">Phase 1 — Discover</div>
+      <h3>What's possible?</h3>
+      <p>Research all SP-API report types for sales & optimization. Don't assume — build a probe first to confirm real access.</p>
+    </div>
+    <div class="legend-card">
+      <div class="phase phase-validate">Phase 2 — Validate access</div>
+      <h3>What do I actually have?</h3>
+      <p>Fire lightweight create_report calls for all 13 candidates. Get a yes/no in seconds. Result: 12 accessible.</p>
+    </div>
+    <div class="legend-card">
+      <div class="phase phase-design">Phase 3 — Design</div>
+      <h3>No duplication, best source wins</h3>
+      <p>Scope to monthly / 2-year. Assign each metric to exactly one canonical table. Prevents conflicting data later.</p>
+    </div>
+    <div class="legend-card">
+      <div class="phase phase-infra">Phase 4 — Infrastructure pivot</div>
+      <h3>Portable from day one</h3>
+      <p>SQLite is local-only. Supabase/PostgreSQL is accessible from any machine — caught this before writing a single fetcher.</p>
+    </div>
+    <div class="legend-card">
+      <div class="phase phase-execute">Phase 5 — Execute</div>
+      <h3>schema → backfill → validate</h3>
+      <p>schema.py creates tables idempotently. backfill.py loops 24 months. Validate on 1 month before the full run.</p>
+    </div>
+  </div>
+
+  <script>
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: 'dark',
+      themeVariables: {
+        primaryColor: '#1a1f35',
+        primaryTextColor: '#c8d8ff',
+        primaryBorderColor: '#7c9eff',
+        lineColor: '#4a4a6a',
+        secondaryColor: '#16161e',
+        tertiaryColor: '#12181f',
+        background: '#0f0f13',
+        mainBkg: '#16161e',
+        nodeBorder: '#4a4a6a',
+        clusterBkg: '#12181f',
+        titleColor: '#ffffff',
+        edgeLabelBackground: '#1a1a2e',
+        fontSize: '14px',
+      },
+      flowchart: {
+        curve: 'basis',
+        padding: 20,
+        htmlLabels: true,
+      }
+    });
+  </script>
+
+</body>
+</html>
