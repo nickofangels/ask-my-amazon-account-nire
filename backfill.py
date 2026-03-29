@@ -2,12 +2,17 @@
 Master backfill — pulls up to 2 years of data from 5 SP-API report types
 and stores them in Supabase (PostgreSQL).
 
-Reports:
-  sales_and_traffic          GET_SALES_AND_TRAFFIC_REPORT
-  sqp                        GET_BRAND_ANALYTICS_SEARCH_QUERY_PERFORMANCE_REPORT
-  search_catalog             GET_BRAND_ANALYTICS_SEARCH_CATALOG_PERFORMANCE_REPORT
-  market_basket              GET_BRAND_ANALYTICS_MARKET_BASKET_REPORT
-  repeat_purchase            GET_BRAND_ANALYTICS_REPEAT_PURCHASE_REPORT
+Reports (run in this order — fast first, SQP last):
+  sales_and_traffic          GET_SALES_AND_TRAFFIC_REPORT            (~1 min/month)
+  search_catalog             GET_BRAND_ANALYTICS_SEARCH_CATALOG_...  (~4 min/month)
+  market_basket              GET_BRAND_ANALYTICS_MARKET_BASKET_...   (~1 min/month)
+  repeat_purchase            GET_BRAND_ANALYTICS_REPEAT_PURCHASE_... (~2 min/month)
+  sqp                        GET_BRAND_ANALYTICS_SEARCH_QUERY_...    (slow/unpredictable)
+
+Resilience:
+  - Outer retry loop: up to 3 passes, 30-min cool-down between passes
+  - Failed months are retried on the next pass, not abandoned
+  - SQP uses single-ASIN requests (API requirement), sequential, 8 brush ASINs only
 
 Usage:
     python backfill.py                              # full 2-year backfill
@@ -24,29 +29,29 @@ import os
 import sys
 import time
 from calendar import monthrange
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 
 import httpx
 from dotenv import load_dotenv
 
 import schema
-from auth import CREDENTIALS, MARKETPLACE, validate
+from auth import CREDENTIALS, MARKETPLACE, MARKETPLACE_ID, validate
 from sp_api.api import Reports
 
 sys.stdout.reconfigure(line_buffering=True)
 load_dotenv()
 validate()
 
-MARKETPLACE_ID = MARKETPLACE.marketplace_id
-
 ALL_REPORTS = [
     'sales_and_traffic',
-    'sqp',
     'search_catalog',
     'market_basket',
     'repeat_purchase',
+    'sqp',              # last — most unpredictable queue
 ]
+
+MAX_PASSES = 3          # outer retry loop passes
+PASS_COOLDOWN = 1800    # 30 min between outer retry passes
 
 
 # ── Date utilities ─────────────────────────────────────────────────────────────
@@ -65,18 +70,18 @@ def month_chunks(start_ym, end_ym):
     return chunks
 
 
-# ── Retry helper ───────────────────────────────────────────────────────────────
+# ── Retry helpers ──────────────────────────────────────────────────────────────
 
-def with_retry(fn, retries=3, label=''):
+def with_retry(fn, retries=3, backoff_base=30, label=''):
     """
-    Call fn(). On failure, retry up to `retries` times with exponential backoff
-    (30s, 60s, 120s). Raises the last exception if all attempts fail.
+    Call fn(). On failure retry up to `retries` times.
+    Wait = backoff_base * 2^attempt between tries.
     """
     for attempt in range(retries):
         try:
             return fn()
         except Exception as e:
-            wait = 30 * (2 ** attempt)
+            wait = backoff_base * (2 ** attempt)
             print(f'  [{label}] Attempt {attempt + 1}/{retries} failed: {e}')
             if attempt < retries - 1:
                 print(f'  [{label}] Retrying in {wait}s...')
@@ -84,6 +89,25 @@ def with_retry(fn, retries=3, label=''):
             else:
                 print(f'  [{label}] All {retries} attempts exhausted.')
                 raise
+
+
+def create_report_with_retry(client, label='', **kwargs):
+    """
+    Wrap client.create_report(**kwargs) with QuotaExceeded-specific retry.
+    6 attempts, exponential backoff starting at 60s (60, 120, 240, 480, 960, 1920s).
+    All other exceptions are re-raised immediately.
+    """
+    for attempt in range(6):
+        try:
+            return client.create_report(**kwargs)
+        except Exception as exc:
+            if 'QuotaExceeded' in str(exc):
+                wait = 60 * (2 ** attempt)
+                print(f'  [{label}] QuotaExceeded — waiting {wait}s before retry ({attempt + 1}/6)...')
+                time.sleep(wait)
+            else:
+                raise
+    raise RuntimeError(f'[{label}] QuotaExceeded after 6 retries')
 
 
 # ── Batch insert helper ────────────────────────────────────────────────────────
@@ -129,39 +153,74 @@ def write_status(label, status, extra=None):
         with open(STATUS_FILE, 'w') as f:
             json.dump(data, f)
     except Exception:
-        pass  # never let status writes crash the backfill
+        pass
 
 
 # ── Shared downloader ──────────────────────────────────────────────────────────
 
-def poll_and_download(client, report_id, label='Report'):
-    """Poll until DONE (20 min timeout), download via S3, return decoded text."""
-    timeout = 1200  # 20 minutes — Brand Analytics reports can be slow
+def poll_and_download(client, report_id, label='Report', timeout=1200):
+    """
+    Poll until DONE, download via S3, return decoded text.
+    timeout: seconds to wait before raising TimeoutError (default 20 min).
+    Includes 3-attempt poll retry for transient network errors and
+    3-attempt download retry with fresh pre-signed URLs on each attempt.
+    """
     start = time.time()
     write_status(label, 'IN_QUEUE', {'started_at': datetime.now().isoformat()})
+    document_id = None
     while True:
+        elapsed = int(time.time() - start)
         if time.time() - start > timeout:
-            write_status(label, 'TIMEOUT')
-            raise TimeoutError(f'{label} timed out after 20 min')
-        resp = client.get_report(reportId=report_id)
-        status = resp.payload['processingStatus']
-        print(f'  [{label}] {status}')
-        write_status(label, status)
+            write_status(label, 'TIMEOUT', {'elapsed_s': elapsed})
+            raise TimeoutError(
+                f'{label} timed out after {timeout // 60} min ({elapsed}s elapsed)'
+            )
+
+        # Poll with retry: 3 attempts, 5s apart; treat 3 consecutive failures as UNKNOWN
+        status = 'UNKNOWN'
+        resp = None
+        for _poll_try in range(3):
+            try:
+                resp = client.get_report(reportId=report_id)
+                status = resp.payload['processingStatus']
+                break
+            except Exception as poll_exc:
+                if _poll_try < 2:
+                    print(f'  [{label}] Poll attempt {_poll_try + 1} failed ({poll_exc}), retrying in 5s...')
+                    time.sleep(5)
+                else:
+                    print(f'  [{label}] Poll failed 3 times — treating as UNKNOWN, continuing...')
+
+        print(f'  [{label}] {status} ({elapsed}s)')
+        write_status(label, status, {'elapsed_s': elapsed})
+
         if status == 'DONE':
             document_id = resp.payload['reportDocumentId']
-            write_status(label, 'DOWNLOADING')
+            write_status(label, 'DOWNLOADING', {'elapsed_s': elapsed})
             break
         if status in ('FATAL', 'CANCELLED'):
-            write_status(label, 'FAILED', {'reason': status})
-            raise RuntimeError(f'{label} failed with status: {status}')
+            detail = resp.payload.get('errorDetails', status) if resp else status
+            write_status(label, 'FAILED', {'reason': status, 'detail': str(detail)})
+            raise RuntimeError(
+                f'{label} failed with status: {status} — {detail}'
+            )
         time.sleep(30)
 
-    doc = client.get_report_document(reportDocumentId=document_id)
-    meta = doc.payload
-    raw = httpx.get(meta['url'], timeout=120).content
-    if meta.get('compressionAlgorithm') == 'GZIP':
-        raw = gzip.decompress(raw)
-    return raw.decode('utf-8', errors='replace')
+    # Download with retry: 3 attempts, re-fetch the pre-signed URL each time
+    for _dl_try in range(1, 4):
+        try:
+            doc = client.get_report_document(reportDocumentId=document_id)
+            meta = doc.payload
+            raw = httpx.get(meta['url'], timeout=120).content
+            if meta.get('compressionAlgorithm') == 'GZIP':
+                raw = gzip.decompress(raw)
+            return raw.decode('utf-8', errors='replace')
+        except Exception as dl_exc:
+            if _dl_try < 3:
+                print(f'  [{label}] Download attempt {_dl_try} failed ({dl_exc}), retrying in 15s...')
+                time.sleep(15)
+            else:
+                raise RuntimeError(f'[{label}] Download failed after 3 attempts: {dl_exc}')
 
 
 # ── ASIN helpers ───────────────────────────────────────────────────────────────
@@ -172,7 +231,11 @@ def fetch_all_asins(client):
     print('Fetching ASIN list from merchant listings...')
 
     def _fetch():
-        resp = client.create_report(reportType='GET_MERCHANT_LISTINGS_ALL_DATA')
+        resp = create_report_with_retry(
+            client, label='Listings',
+            reportType='GET_MERCHANT_LISTINGS_ALL_DATA',
+            marketplaceIds=[MARKETPLACE_ID],
+        )
         return poll_and_download(client, resp.payload['reportId'], 'Listings')
 
     content = with_retry(_fetch, label='Listings')
@@ -186,28 +249,27 @@ def fetch_all_asins(client):
     return asins
 
 
-def batch_asins(asins, char_limit=200):
-    """Split ASIN list into batches that fit within the SP-API 200-char limit."""
-    batches, current, current_len = [], [], 0
-    for asin in asins:
-        addition = len(asin) + (1 if current else 0)
-        if current_len + addition > char_limit:
-            batches.append(current)
-            current, current_len = [asin], len(asin)
-        else:
-            current.append(asin)
-            current_len += addition
-    if current:
-        batches.append(current)
-    return batches
+# 8 Nire Beauty makeup brush ASINs (the only ones we need SQP data for)
+SQP_ASINS = [
+    'B01FQZNFYG',  # Nire Beauty 15pc Professional Makeup Brush Set
+    'B0B63QMTBQ',  # Nire Beauty 15pc Glitter Makeup Brushes
+    'B0CHMQGG2F',  # Nire Beauty 15pc Pink Makeup Brushes
+    'B08B9124NB',  # Nire Beauty White 15pc Professional Makeup Brush Set
+    'B089MFSYWT',  # Nire Beauty 15pc Professional Makeup Brush Set (variant)
+    'B08GM17CZF',  # Nire Beauty Artistry Makeup Brush Set (parent)
+    'B01N0ELK49',  # Nire Eye Brush Set
+    'B07WX2W2F7',  # Nire Beauty Essential Glow Set
+]
 
 
 # ── Fetchers ───────────────────────────────────────────────────────────────────
+# Each fetcher accepts a list of chunks and returns a list of chunks that failed.
 
 def fetch_sales_and_traffic(client, chunks):
     print(f'\n=== sales_and_traffic ({len(chunks)} months) ===')
     conn = schema.get_conn()
     total = 0
+    failed_chunks = []
     INSERT_SQL = '''
         INSERT INTO sales_and_traffic
             (marketplace, asin, parent_asin, sku, start_date, end_date,
@@ -223,10 +285,12 @@ def fetch_sales_and_traffic(client, chunks):
             print(f'\n→ {label}')
 
             def _run(start=start, end=end):
-                resp = client.create_report(
+                resp = create_report_with_retry(
+                    client, label=label,
                     reportType='GET_SALES_AND_TRAFFIC_REPORT',
                     dataStartTime=start.isoformat() + 'T00:00:00Z',
-                    dataEndTime=end.isoformat() + 'T00:00:00Z',
+                    dataEndTime=end.isoformat() + 'T23:59:59Z',
+                    marketplaceIds=[MARKETPLACE_ID],
                     reportOptions={'dateGranularity': 'MONTH', 'asinGranularity': 'CHILD'},
                 )
                 return poll_and_download(client, resp.payload['reportId'], label)
@@ -264,27 +328,33 @@ def fetch_sales_and_traffic(client, chunks):
             except Exception as e:
                 write_status(label, 'FAILED', {'error': str(e)})
                 conn = safe_rollback(conn)
-                print(f'  FAILED after retries: {e}')
+                print(f'  FAILED: {e}')
+                failed_chunks.append((start, end))
     finally:
         conn.close()
-    print(f'sales_and_traffic done: {total} rows total')
+    print(f'sales_and_traffic done: {total} rows total, {len(failed_chunks)} failed months')
+    return failed_chunks
 
 
-def _fetch_sqp_batch(client, start, end, batch, b_idx, n_batches):
-    """Fetch and parse one SQP ASIN batch. Returns list of row tuples."""
-    label = f'SQP {start} b{b_idx}/{n_batches}'
-    print(f'\n→ {label}')
+def _fetch_sqp_single(client, asin, start, end, a_idx, n_asins):
+    """Fetch SQP for ONE ASIN + ONE month. Returns list of row tuples."""
+    label = f'SQP {asin} {start}'
+    print(f'\n→ {label} ({a_idx}/{n_asins})')
 
     def _run():
-        resp = client.create_report(
+        resp = create_report_with_retry(
+            client, label=label,
             reportType='GET_BRAND_ANALYTICS_SEARCH_QUERY_PERFORMANCE_REPORT',
             dataStartTime=start.isoformat() + 'T00:00:00Z',
-            dataEndTime=end.isoformat() + 'T00:00:00Z',
-            reportOptions={'reportPeriod': 'MONTH', 'asin': ' '.join(batch)},
+            dataEndTime=end.isoformat() + 'T23:59:59Z',
+            marketplaceIds=[MARKETPLACE_ID],
+            reportOptions={'reportPeriod': 'MONTH', 'asin': asin},
         )
-        return poll_and_download(client, resp.payload['reportId'], label)
+        return poll_and_download(
+            client, resp.payload['reportId'], label, timeout=1200
+        )
 
-    content = with_retry(_run, label=label)
+    content = with_retry(_run, retries=5, backoff_base=60, label=label)
     data = json.loads(content)
     records = (
         data if isinstance(data, list)
@@ -300,7 +370,7 @@ def _fetch_sqp_batch(client, start, end, batch, b_idx, n_batches):
         purch = r.get('purchaseData', {})
         rows.append((
             MARKETPLACE_ID,
-            r.get('asin'),
+            r.get('asin') or asin,
             r.get('startDate'),
             r.get('endDate'),
             sq.get('searchQuery'),
@@ -324,10 +394,14 @@ def _fetch_sqp_batch(client, start, end, batch, b_idx, n_batches):
 
 
 def fetch_sqp(client, chunks, asins):
-    batches = batch_asins(asins)
-    print(f'\n=== sqp_report ({len(chunks)} months × {len(batches)} ASIN batch(es)) ===')
+    """Fetch SQP one ASIN at a time, sequentially (API requirement)."""
+    total_requests = len(asins) * len(chunks)
+    print(f'\n=== sqp_report ({len(asins)} ASINs × {len(chunks)} months = {total_requests} requests) ===')
+    print(f'    Single ASIN per request, sequential, 20-min timeout, 5 retries')
+
     conn = schema.get_conn()
     total = 0
+    failed_chunks = []
     INSERT_SQL = '''
         INSERT INTO sqp_report
             (marketplace, asin, start_date, end_date, search_query,
@@ -339,44 +413,50 @@ def fetch_sqp(client, chunks, asins):
         ON CONFLICT (marketplace, asin, start_date, end_date, search_query)
         DO NOTHING
     '''
+    request_num = 0
     try:
         for start, end in chunks:
-            # Fetch all ASIN batches for this month in parallel (up to 4 at once)
-            all_rows = []
-            with ThreadPoolExecutor(max_workers=4) as pool:
-                futures = {
-                    pool.submit(
-                        _fetch_sqp_batch, client, start, end, batch, b_idx, len(batches)
-                    ): b_idx
-                    for b_idx, batch in enumerate(batches, 1)
-                }
-                for future in as_completed(futures):
-                    b_idx = futures[future]
-                    try:
-                        all_rows.extend(future.result())
-                    except Exception as e:
-                        write_status(f'SQP b{b_idx}', 'FAILED', {'error': str(e)})
-                        print(f'  SQP batch {b_idx} FAILED after retries: {e}')
-
-            if all_rows:
+            month_rows = []
+            month_failures = 0
+            for a_idx, asin in enumerate(asins, 1):
+                request_num += 1
                 try:
-                    batch_insert(conn, INSERT_SQL, all_rows)
-                    total += len(all_rows)
-                    write_status(f'SQP {start}', 'INSERTED', {'rows': len(all_rows)})
-                    print(f'  Month {start}: {len(all_rows)} rows inserted')
+                    rows = _fetch_sqp_single(
+                        client, asin, start, end, a_idx, len(asins)
+                    )
+                    month_rows.extend(rows)
+                    print(f'  Progress: {request_num}/{total_requests}')
+                except Exception as e:
+                    write_status(f'SQP {asin} {start}', 'FAILED', {'error': str(e)})
+                    print(f'  SQP {asin} {start} FAILED: {e}')
+                    month_failures += 1
+
+            if month_rows:
+                try:
+                    batch_insert(conn, INSERT_SQL, month_rows)
+                    total += len(month_rows)
+                    write_status(f'SQP {start}', 'INSERTED', {'rows': len(month_rows)})
+                    print(f'  Month {start}: {len(month_rows)} rows inserted')
                 except Exception as e:
                     write_status(f'SQP {start}', 'FAILED', {'error': str(e)})
                     conn = safe_rollback(conn)
                     print(f'  DB insert failed for {start}: {e}')
+                    failed_chunks.append((start, end))
+            elif month_failures == len(asins):
+                failed_chunks.append((start, end))
+            else:
+                print(f'  Month {start}: 0 rows (no SQP data)')
     finally:
         conn.close()
-    print(f'sqp_report done: {total} rows total')
+    print(f'sqp_report done: {total} rows total, {len(failed_chunks)} failed months')
+    return failed_chunks
 
 
 def fetch_search_catalog(client, chunks):
     print(f'\n=== search_catalog_performance ({len(chunks)} months) ===')
     conn = schema.get_conn()
     total = 0
+    failed_chunks = []
     INSERT_SQL = '''
         INSERT INTO search_catalog_performance
             (marketplace, asin, start_date, end_date, impression_count,
@@ -391,10 +471,12 @@ def fetch_search_catalog(client, chunks):
             print(f'\n→ {label}')
 
             def _run(start=start, end=end):
-                resp = client.create_report(
+                resp = create_report_with_retry(
+                    client, label=label,
                     reportType='GET_BRAND_ANALYTICS_SEARCH_CATALOG_PERFORMANCE_REPORT',
                     dataStartTime=start.isoformat() + 'T00:00:00Z',
                     dataEndTime=end.isoformat() + 'T00:00:00Z',
+                    marketplaceIds=[MARKETPLACE_ID],
                     reportOptions={'reportPeriod': 'MONTH'},
                 )
                 return poll_and_download(client, resp.payload['reportId'], label)
@@ -431,16 +513,19 @@ def fetch_search_catalog(client, chunks):
             except Exception as e:
                 write_status(label, 'FAILED', {'error': str(e)})
                 conn = safe_rollback(conn)
-                print(f'  FAILED after retries: {e}')
+                print(f'  FAILED: {e}')
+                failed_chunks.append((start, end))
     finally:
         conn.close()
-    print(f'search_catalog_performance done: {total} rows total')
+    print(f'search_catalog_performance done: {total} rows total, {len(failed_chunks)} failed months')
+    return failed_chunks
 
 
 def fetch_market_basket(client, chunks):
     print(f'\n=== market_basket ({len(chunks)} months) ===')
     conn = schema.get_conn()
     total = 0
+    failed_chunks = []
     INSERT_SQL = '''
         INSERT INTO market_basket
             (marketplace, asin, start_date, end_date, purchased_with_asin,
@@ -455,10 +540,12 @@ def fetch_market_basket(client, chunks):
             print(f'\n→ {label}')
 
             def _run(start=start, end=end):
-                resp = client.create_report(
+                resp = create_report_with_retry(
+                    client, label=label,
                     reportType='GET_BRAND_ANALYTICS_MARKET_BASKET_REPORT',
                     dataStartTime=start.isoformat() + 'T00:00:00Z',
                     dataEndTime=end.isoformat() + 'T00:00:00Z',
+                    marketplaceIds=[MARKETPLACE_ID],
                     reportOptions={'reportPeriod': 'MONTH'},
                 )
                 return poll_and_download(client, resp.payload['reportId'], label)
@@ -486,16 +573,19 @@ def fetch_market_basket(client, chunks):
             except Exception as e:
                 write_status(label, 'FAILED', {'error': str(e)})
                 conn = safe_rollback(conn)
-                print(f'  FAILED after retries: {e}')
+                print(f'  FAILED: {e}')
+                failed_chunks.append((start, end))
     finally:
         conn.close()
-    print(f'market_basket done: {total} rows total')
+    print(f'market_basket done: {total} rows total, {len(failed_chunks)} failed months')
+    return failed_chunks
 
 
 def fetch_repeat_purchase(client, chunks):
     print(f'\n=== repeat_purchase ({len(chunks)} months) ===')
     conn = schema.get_conn()
     total = 0
+    failed_chunks = []
     INSERT_SQL = '''
         INSERT INTO repeat_purchase
             (marketplace, asin, start_date, end_date, orders, unique_customers,
@@ -510,10 +600,12 @@ def fetch_repeat_purchase(client, chunks):
             print(f'\n→ {label}')
 
             def _run(start=start, end=end):
-                resp = client.create_report(
+                resp = create_report_with_retry(
+                    client, label=label,
                     reportType='GET_BRAND_ANALYTICS_REPEAT_PURCHASE_REPORT',
                     dataStartTime=start.isoformat() + 'T00:00:00Z',
                     dataEndTime=end.isoformat() + 'T00:00:00Z',
+                    marketplaceIds=[MARKETPLACE_ID],
                     reportOptions={'reportPeriod': 'MONTH'},
                 )
                 return poll_and_download(client, resp.payload['reportId'], label)
@@ -545,20 +637,18 @@ def fetch_repeat_purchase(client, chunks):
             except Exception as e:
                 write_status(label, 'FAILED', {'error': str(e)})
                 conn = safe_rollback(conn)
-                print(f'  FAILED after retries: {e}')
+                print(f'  FAILED: {e}')
+                failed_chunks.append((start, end))
     finally:
         conn.close()
-    print(f'repeat_purchase done: {total} rows total')
+    print(f'repeat_purchase done: {total} rows total, {len(failed_chunks)} failed months')
+    return failed_chunks
 
 
-# ── DB readiness check ────────────────────────────────────────────────────────
+# ── DB readiness check ─────────────────────────────────────────────────────────
 
 def wait_for_db(max_wait_minutes=30, poll_interval=30):
-    """
-    Block until the Supabase database accepts connections.
-    Useful when the project is paused and needs time to resume.
-    Polls every `poll_interval` seconds for up to `max_wait_minutes`.
-    """
+    """Block until Supabase accepts connections."""
     deadline = time.time() + max_wait_minutes * 60
     attempt = 0
     while True:
@@ -576,7 +666,7 @@ def wait_for_db(max_wait_minutes=30, poll_interval=30):
                     f'Last error: {e}'
                 )
             print(
-                f'  [DB] Not reachable yet (attempt {attempt}): {e}\n'
+                f'  [DB] Not reachable (attempt {attempt}): {e}\n'
                 f'  Retrying in {poll_interval}s... ({remaining} min remaining)'
             )
             time.sleep(poll_interval)
@@ -601,8 +691,16 @@ def print_row_counts():
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
+FETCHERS = {
+    'sales_and_traffic': fetch_sales_and_traffic,
+    'search_catalog':    fetch_search_catalog,
+    'market_basket':     fetch_market_basket,
+    'repeat_purchase':   fetch_repeat_purchase,
+}
+
+
 def main():
-    parser = argparse.ArgumentParser(description='Amazon SP-API → Supabase backfill')
+    parser = argparse.ArgumentParser(description='Amazon SP-API → Supabase overnight backfill')
     parser.add_argument('--test', action='store_true',
                         help='Run Jan 2026 only (quick validation)')
     parser.add_argument('--start', default=None,
@@ -640,30 +738,65 @@ def main():
         print(f'=== BACKFILL: {date(*start_ym, 1)} → {date(*end_ym, monthrange(*end_ym)[1])} ===')
 
     enabled = set(args.reports.split(',')) if args.reports else set(ALL_REPORTS)
-    chunks = month_chunks(start_ym, end_ym)
-    print(f'{len(chunks)} month chunk(s), reports: {sorted(enabled)}\n')
+    all_chunks = month_chunks(start_ym, end_ym)
+    print(f'{len(all_chunks)} month chunk(s), reports: {sorted(enabled)}\n')
 
     wait_for_db()
     schema.init_db()
     client = Reports(credentials=CREDENTIALS, marketplace=MARKETPLACE)
 
-    asins = None
-    if 'sqp' in enabled:
-        asins = fetch_all_asins(client)
-        if not asins:
-            print('No ASINs found — skipping sqp.')
-            enabled.discard('sqp')
+    # Use hardcoded makeup brush ASINs for SQP
+    asins = SQP_ASINS if 'sqp' in enabled else None
+    if asins:
+        print(f'SQP will pull {len(asins)} makeup brush ASINs')
 
-    if 'sales_and_traffic' in enabled:
-        fetch_sales_and_traffic(client, chunks)
-    if 'sqp' in enabled:
-        fetch_sqp(client, chunks, asins)
-    if 'search_catalog' in enabled:
-        fetch_search_catalog(client, chunks)
-    if 'market_basket' in enabled:
-        fetch_market_basket(client, chunks)
-    if 'repeat_purchase' in enabled:
-        fetch_repeat_purchase(client, chunks)
+    # Outer retry loop: up to MAX_PASSES passes, retrying only failed months
+    # pending[report] = list of (start, end) chunks still to do
+    pending = {r: list(all_chunks) for r in enabled}
+    grand_total_failed = {}
+
+    for pass_num in range(1, MAX_PASSES + 1):
+        print(f'\n{"="*60}')
+        print(f'PASS {pass_num} of {MAX_PASSES}')
+        print(f'{"="*60}')
+
+        still_failing = {}
+
+        # Run reports in order: fast 4 first, SQP last
+        for report in ALL_REPORTS:
+            if report not in pending or not pending[report]:
+                continue
+
+            chunks_to_run = pending[report]
+            print(f'\n  Queuing {len(chunks_to_run)} month(s) for {report}')
+
+            if report == 'sqp':
+                failed = fetch_sqp(client, chunks_to_run, asins)
+            else:
+                failed = FETCHERS[report](client, chunks_to_run)
+
+            if failed:
+                still_failing[report] = failed
+                grand_total_failed[report] = failed
+
+        # Summary for this pass
+        total_failed = sum(len(v) for v in still_failing.values())
+        print(f'\n--- Pass {pass_num} complete ---')
+        if total_failed == 0:
+            print('All reports succeeded. No retries needed.')
+            break
+        else:
+            print(f'{total_failed} month(s) still failed:')
+            for r, chunks in still_failing.items():
+                dates = [str(c[0]) for c in chunks]
+                print(f'  {r}: {dates}')
+
+            if pass_num < MAX_PASSES:
+                print(f'\nWaiting {PASS_COOLDOWN // 60} min before pass {pass_num + 1}...')
+                time.sleep(PASS_COOLDOWN)
+                pending = still_failing
+            else:
+                print(f'\nMax passes ({MAX_PASSES}) reached. Giving up on remaining months.')
 
     print_row_counts()
     print('\nBackfill complete.')

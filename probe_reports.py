@@ -8,7 +8,7 @@ Usage:
     python probe_reports.py
 """
 
-from auth import CREDENTIALS, MARKETPLACE, validate
+from auth import CREDENTIALS, MARKETPLACE, MARKETPLACE_ID, validate
 from sp_api.api import Reports
 
 validate()
@@ -31,7 +31,7 @@ REPORTS = [
     (
         'Search Query Performance (SQP)',
         'GET_BRAND_ANALYTICS_SEARCH_QUERY_PERFORMANCE_REPORT',
-        {'reportPeriod': 'MONTH'},
+        {'reportPeriod': 'MONTH', 'asin': 'B01FQZNFYG'},
         MONTH_START, MONTH_END,
     ),
     (
@@ -137,6 +137,7 @@ for label, report_type, options, start, end in REPORTS:
         reportType=report_type,
         dataStartTime=start,
         dataEndTime=end,
+        marketplaceIds=[MARKETPLACE_ID],
     )
     if options:
         kwargs['reportOptions'] = options

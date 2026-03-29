@@ -7,7 +7,7 @@ import time
 from datetime import datetime
 
 import httpx
-from auth import CREDENTIALS, MARKETPLACE, validate
+from auth import CREDENTIALS, MARKETPLACE, MARKETPLACE_ID, validate
 from sp_api.api import Reports
 
 validate()
@@ -33,8 +33,20 @@ def poll_and_download(reports_client, report_id, label='Report'):
         if time.time() - start > timeout:
             raise TimeoutError(f'{label} {report_id} did not complete within 10 minutes')
 
-        status_resp = reports_client.get_report(reportId=report_id)
-        status = status_resp.payload['processingStatus']
+        # Poll with retry: 3 attempts, 5s apart; treat 3 consecutive failures as UNKNOWN
+        status = 'UNKNOWN'
+        for _poll_try in range(3):
+            try:
+                status_resp = reports_client.get_report(reportId=report_id)
+                status = status_resp.payload['processingStatus']
+                break
+            except Exception as poll_exc:
+                if _poll_try < 2:
+                    print(f'  [{label}] Poll attempt {_poll_try + 1} failed ({poll_exc}), retrying in 5s...')
+                    time.sleep(5)
+                else:
+                    print(f'  [{label}] Poll failed 3 times — treating as UNKNOWN, continuing...')
+
         print(f'  [{label}] Status: {status}')
 
         if status == 'DONE':
@@ -49,18 +61,25 @@ def poll_and_download(reports_client, report_id, label='Report'):
 
         time.sleep(30)
 
-    doc_resp = reports_client.get_report_document(reportDocumentId=document_id)
-    doc_meta = doc_resp.payload
-
-    if isinstance(doc_meta, dict) and 'url' in doc_meta:
-        url = doc_meta['url']
-        compression = doc_meta.get('compressionAlgorithm', '')
-        raw = httpx.get(url, timeout=120).content
-        if compression == 'GZIP':
-            raw = gzip.decompress(raw)
-        return raw.decode('utf-8', errors='replace')
-
-    return str(doc_meta)
+    # Download with retry: 3 attempts, re-fetch the pre-signed URL each time
+    for _dl_try in range(1, 4):
+        try:
+            doc_resp = reports_client.get_report_document(reportDocumentId=document_id)
+            doc_meta = doc_resp.payload
+            if isinstance(doc_meta, dict) and 'url' in doc_meta:
+                url = doc_meta['url']
+                compression = doc_meta.get('compressionAlgorithm', '')
+                raw = httpx.get(url, timeout=120).content
+                if compression == 'GZIP':
+                    raw = gzip.decompress(raw)
+                return raw.decode('utf-8', errors='replace')
+            return str(doc_meta)
+        except Exception as dl_exc:
+            if _dl_try < 3:
+                print(f'  [{label}] Download attempt {_dl_try} failed ({dl_exc}), retrying in 15s...')
+                time.sleep(15)
+            else:
+                raise RuntimeError(f'[{label}] Download failed after 3 attempts: {dl_exc}')
 
 
 # ---------------------------------------------------------------------------
@@ -69,7 +88,10 @@ def poll_and_download(reports_client, report_id, label='Report'):
 
 def fetch_all_asins(reports_client):
     print('Requesting merchant listings report to enumerate ASINs...')
-    resp = reports_client.create_report(reportType='GET_MERCHANT_LISTINGS_ALL_DATA')
+    resp = reports_client.create_report(
+        reportType='GET_MERCHANT_LISTINGS_ALL_DATA',
+        marketplaceIds=[MARKETPLACE_ID],
+    )
     report_id = resp.payload['reportId']
     print(f'  Listings report ID: {report_id}')
 
@@ -115,15 +137,31 @@ def request_sqp_batch(reports_client, asin_batch, batch_num, total):
     asin_str = ' '.join(asin_batch)
     print(f'\nBatch {batch_num}/{total}: {len(asin_batch)} ASIN(s)')
 
-    resp = reports_client.create_report(
+    create_kwargs = dict(
         reportType=REPORT_TYPE,
         dataStartTime=DATA_START,
         dataEndTime=DATA_END,
+        marketplaceIds=[MARKETPLACE_ID],
         reportOptions={
             'reportPeriod': 'MONTH',
             'asin': asin_str,
         },
     )
+
+    for _create_try in range(6):
+        try:
+            resp = reports_client.create_report(**create_kwargs)
+            break
+        except Exception as create_exc:
+            if 'QuotaExceeded' in str(create_exc):
+                wait = 60 * (2 ** _create_try)
+                print(f'  QuotaExceeded — waiting {wait}s before retry ({_create_try + 1}/6)...')
+                time.sleep(wait)
+            else:
+                raise
+    else:
+        raise RuntimeError(f'QuotaExceeded after 6 retries for batch {batch_num}')
+
     report_id = resp.payload['reportId']
     print(f'  SQP report ID: {report_id}')
 
