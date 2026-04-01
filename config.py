@@ -121,12 +121,25 @@ def full_month_bounds(label: str) -> tuple[date, date]:
     return first, last
 
 
-def get_active_asins() -> list[str]:
-    """Return sorted list of Active ASINs from the listings table.
+def get_sqp_asins() -> list[str]:
+    """Return ASINs for SQP reports.
 
-    Falls back to SQP_ASINS from backfill.py if the listings table
-    doesn't exist yet (it's created in Phase 2).
+    Resolution order:
+      1. SQP_ASINS env var (comma-separated) — set this during account setup
+      2. Listings table (active ASINs) — available after first listings pull
+      3. Error — forces explicit setup rather than silent wrong data
+
+    This is intentionally NOT hardcoded. When setting up a new marketplace
+    or seller account, add SQP_ASINS to .env with the ASINs you want to track.
     """
+    # 1. Environment variable (primary — set during account setup)
+    env_asins = os.environ.get("SQP_ASINS", "").strip()
+    if env_asins:
+        asins = [a.strip() for a in env_asins.split(",") if a.strip()]
+        if asins:
+            return asins
+
+    # 2. Listings table (available after first pull)
     try:
         from schema import get_conn
         import psycopg2.extras
@@ -148,9 +161,32 @@ def get_active_asins() -> list[str]:
     except Exception:
         pass
 
-    # Fallback: use hardcoded ASINs from backfill.py
-    from backfill import SQP_ASINS
-    return list(SQP_ASINS)
+    raise EnvironmentError(
+        "No ASINs configured. Set SQP_ASINS in .env (comma-separated) "
+        "with the ASINs you want to track.\n"
+        "Example: SQP_ASINS=B01FQZNFYG,B0B63QMTBQ,B0CHMQGG2F"
+    )
+
+
+# Keep old name as alias for backwards compat with backfill.py imports
+get_active_asins = get_sqp_asins
+
+
+# ---------------------------------------------------------------------------
+# Raw data directory paths (for db/load.py file-based loading)
+# ---------------------------------------------------------------------------
+
+from pathlib import Path as _Path
+
+ROOT = _Path(__file__).resolve().parent
+RAW_DIR = ROOT / "raw"
+SALES_TRAFFIC_DIR = RAW_DIR / "sales_traffic"
+SEARCH_TERMS_DIR = RAW_DIR / "search_terms"
+SEARCH_QUERY_PERF_DIR = RAW_DIR / "sqp"
+CATALOG_PERF_DIR = RAW_DIR / "search_catalog_performance"
+MARKET_BASKET_DIR = RAW_DIR / "market_basket"
+REPEAT_PURCHASE_DIR = RAW_DIR / "repeat_purchase"
+LISTINGS_TSV = RAW_DIR / "listings" / "listings.tsv"
 
 
 if __name__ == "__main__":

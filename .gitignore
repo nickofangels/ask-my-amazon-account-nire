@@ -13,6 +13,9 @@ data/**/*.tsv
 data/**/*.txt
 data/amazon.db
 
+# Raw downloaded reports (large, re-downloadable)
+raw/
+
 # Python artifacts
 __pycache__/
 *.py[cod]

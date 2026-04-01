@@ -249,16 +249,14 @@ def fetch_all_asins(client):
     return asins
 
 
-# 8 Nire Beauty makeup brush ASINs (the only ones we need SQP data for)
+# 6 active Nire Beauty ASINs (confirmed with Erin — Luxe England & Lüso are dead)
 SQP_ASINS = [
-    'B01FQZNFYG',  # Nire Beauty 15pc Professional Makeup Brush Set
-    'B0B63QMTBQ',  # Nire Beauty 15pc Glitter Makeup Brushes
-    'B0CHMQGG2F',  # Nire Beauty 15pc Pink Makeup Brushes
-    'B08B9124NB',  # Nire Beauty White 15pc Professional Makeup Brush Set
-    'B089MFSYWT',  # Nire Beauty 15pc Professional Makeup Brush Set (variant)
-    'B08GM17CZF',  # Nire Beauty Artistry Makeup Brush Set (parent)
-    'B01N0ELK49',  # Nire Eye Brush Set
-    'B07WX2W2F7',  # Nire Beauty Essential Glow Set
+    'B01FQZNFYG',  # $75  15pc Professional Makeup Brush Set (main, 4 SKUs)
+    'B0B63QMTBQ',  # $75  15pc Glitter Makeup Brushes
+    'B0CHMQGG2F',  # $75  15pc Pink Makeup Brushes
+    'B08B9124NB',  # $75  White 15pc Professional Makeup Brush Set
+    'B089MFSYWT',  # $75  15pc Professional Makeup Brush Set (variant)
+    'B01N0ELK49',  # $30  Eye Brush Set
 ]
 
 

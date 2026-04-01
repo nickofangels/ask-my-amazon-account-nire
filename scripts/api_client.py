@@ -21,7 +21,7 @@ def get_client(api_class=Reports):
 
 
 def download_report(report_type, start, end, report_options=None,
-                    poll_interval=20, max_wait=600):
+                    poll_interval=10, max_wait=600):
     """Create, poll, and download a report. Returns decoded content string.
 
     Args:

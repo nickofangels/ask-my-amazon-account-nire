@@ -1,14 +1,28 @@
 """
 Database schema for the Amazon business database (Supabase / PostgreSQL).
 
-5 tables:
-  sales_and_traffic          — revenue, units, sessions, buy box, conversion per ASIN
-  sqp_report                 — per-ASIN per-query search funnel
-  search_catalog_performance — catalog-wide search funnel per ASIN
-  market_basket              — cross-sell / co-purchase signals
-  repeat_purchase            — LTV / retention per ASIN
+Tables are organized into tiers:
 
-Call init_db() at startup to ensure all tables exist.
+  Tier 1 — Derived (loaded from raw JSON files by db/load.py):
+    sales_traffic_asin          — monthly per-ASIN sales & traffic
+    search_query_performance    — per-ASIN per-query search funnel
+    catalog_performance         — catalog-wide search funnel per ASIN
+    repeat_purchase             — LTV / retention per ASIN
+    market_basket               — cross-sell / co-purchase signals
+    search_terms                — marketplace-wide search terms (filtered to brand ASINs)
+    listings                    — current ASIN/SKU catalog snapshot
+
+  Tier 2 — Scored (built by db/build_*.py):
+    asin_keyword_scores         — full ASIN-keyword scoring matrix
+    keyword_targets             — keyword-level aggregation & strategy
+
+  Tier 3 — Meta:
+    keyword_goals               — user-set keyword targets (dashboard-edited)
+    period_meta                 — L52/P52 period boundaries
+    pull_log                    — audit trail of all data loads
+    data_coverage               — row counts per table/month
+
+Call init_db() at startup to ensure all tables + indexes exist.
 Call get_conn() to get a live psycopg2 connection.
 """
 
@@ -34,124 +48,11 @@ def get_conn():
     )
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Tier 1 — Derived tables (loaded from raw JSON files by db/load.py)
+# ══════════════════════════════════════════════════════════════════════════════
+
 TABLES = [
-    # ── Sales & Traffic ────────────────────────────────────────────────────────
-    # Source: GET_SALES_AND_TRAFFIC_REPORT
-    # Canonical for: revenue, units, page views, sessions, conversion, buy box %
-    """
-    CREATE TABLE IF NOT EXISTS sales_and_traffic (
-        id                      SERIAL PRIMARY KEY,
-        marketplace             TEXT NOT NULL,
-        asin                    TEXT NOT NULL DEFAULT '',
-        parent_asin             TEXT NOT NULL DEFAULT '',
-        sku                     TEXT NOT NULL DEFAULT '',
-        start_date              TEXT NOT NULL,
-        end_date                TEXT NOT NULL,
-        units_ordered           INTEGER,
-        ordered_product_sales   DOUBLE PRECISION,
-        currency                TEXT,
-        total_order_items       INTEGER,
-        sessions                INTEGER,
-        page_views              INTEGER,
-        buy_box_percentage      DOUBLE PRECISION,
-        unit_session_percentage DOUBLE PRECISION,
-        downloaded_at           TEXT NOT NULL,
-        UNIQUE (marketplace, asin, sku, start_date, end_date)
-    )
-    """,
-
-    # ── Search Query Performance ───────────────────────────────────────────────
-    # Source: GET_BRAND_ANALYTICS_SEARCH_QUERY_PERFORMANCE_REPORT
-    # Canonical for: per-ASIN per-query impressions, clicks, cart adds, purchases
-    """
-    CREATE TABLE IF NOT EXISTS sqp_report (
-        id                    SERIAL PRIMARY KEY,
-        marketplace           TEXT NOT NULL,
-        asin                  TEXT NOT NULL,
-        start_date            TEXT NOT NULL,
-        end_date              TEXT NOT NULL,
-        search_query          TEXT NOT NULL,
-        search_query_score    INTEGER,
-        search_query_volume   INTEGER,
-        total_impressions     INTEGER,
-        asin_impressions      INTEGER,
-        asin_impression_share DOUBLE PRECISION,
-        total_clicks          INTEGER,
-        asin_clicks           INTEGER,
-        asin_click_share      DOUBLE PRECISION,
-        total_cart_adds       INTEGER,
-        asin_cart_adds        INTEGER,
-        total_purchases       INTEGER,
-        asin_purchases        INTEGER,
-        downloaded_at         TEXT NOT NULL,
-        UNIQUE (marketplace, asin, start_date, end_date, search_query)
-    )
-    """,
-
-    # ── Search Catalog Performance ─────────────────────────────────────────────
-    # Source: GET_BRAND_ANALYTICS_SEARCH_CATALOG_PERFORMANCE_REPORT
-    # Canonical for: catalog-wide search funnel per ASIN (no query breakdown)
-    """
-    CREATE TABLE IF NOT EXISTS search_catalog_performance (
-        id                   SERIAL PRIMARY KEY,
-        marketplace          TEXT NOT NULL,
-        asin                 TEXT NOT NULL,
-        start_date           TEXT NOT NULL,
-        end_date             TEXT NOT NULL,
-        impression_count     INTEGER,
-        click_count          INTEGER,
-        click_rate           DOUBLE PRECISION,
-        cart_add_count       INTEGER,
-        purchase_count       INTEGER,
-        search_traffic_sales DOUBLE PRECISION,
-        conversion_rate      DOUBLE PRECISION,
-        downloaded_at        TEXT NOT NULL,
-        UNIQUE (marketplace, asin, start_date, end_date)
-    )
-    """,
-
-    # ── Market Basket ─────────────────────────────────────────────────────────
-    # Source: GET_BRAND_ANALYTICS_MARKET_BASKET_REPORT
-    # Canonical for: cross-sell signals, bundle opportunities
-    """
-    CREATE TABLE IF NOT EXISTS market_basket (
-        id                  SERIAL PRIMARY KEY,
-        marketplace         TEXT NOT NULL,
-        asin                TEXT NOT NULL,
-        start_date          TEXT NOT NULL,
-        end_date            TEXT NOT NULL,
-        purchased_with_asin TEXT NOT NULL,
-        purchased_with_rank INTEGER,
-        combination_pct     DOUBLE PRECISION,
-        downloaded_at       TEXT NOT NULL,
-        UNIQUE (marketplace, asin, start_date, end_date, purchased_with_asin)
-    )
-    """,
-
-    # ── Repeat Purchase ───────────────────────────────────────────────────────
-    # Source: GET_BRAND_ANALYTICS_REPEAT_PURCHASE_REPORT
-    # Canonical for: LTV / retention metrics per ASIN
-    """
-    CREATE TABLE IF NOT EXISTS repeat_purchase (
-        id                          SERIAL PRIMARY KEY,
-        marketplace                 TEXT NOT NULL,
-        asin                        TEXT NOT NULL,
-        start_date                  TEXT NOT NULL,
-        end_date                    TEXT NOT NULL,
-        orders                      INTEGER,
-        unique_customers            INTEGER,
-        repeat_customers_pct        DOUBLE PRECISION,
-        repeat_purchase_revenue     DOUBLE PRECISION,
-        repeat_purchase_revenue_pct DOUBLE PRECISION,
-        currency                    TEXT,
-        downloaded_at               TEXT NOT NULL,
-        UNIQUE (marketplace, asin, start_date, end_date)
-    )
-    """,
-    # ══════════════════════════════════════════════════════════════════════════
-    # Derived / Dashboard tables (created by transform.py and build scripts)
-    # ══════════════════════════════════════════════════════════════════════════
-
     # ── Listings ──────────────────────────────────────────────────────────────
     # Source: GET_MERCHANT_LISTINGS_ALL_DATA
     """
@@ -169,25 +70,8 @@ TABLES = [
     )
     """,
 
-    # ── Sales & Traffic — Daily brand totals ──────────────────────────────────
-    # Source: GET_SALES_AND_TRAFFIC_REPORT (daily granularity)
-    """
-    CREATE TABLE IF NOT EXISTS sales_traffic_daily (
-        date                TEXT NOT NULL PRIMARY KEY,
-        period              TEXT,
-        revenue             DOUBLE PRECISION,
-        units               INTEGER,
-        total_order_items   INTEGER,
-        units_refunded      INTEGER,
-        sessions            INTEGER,
-        page_views          INTEGER,
-        buy_box_pct         DOUBLE PRECISION,
-        conversion_rate     DOUBLE PRECISION,
-        pulled_at           TEXT NOT NULL
-    )
-    """,
-
-    # ── Sales & Traffic — Monthly per-ASIN (derived from sales_and_traffic) ──
+    # ── Sales & Traffic — Monthly per-ASIN ────────────────────────────────────
+    # Source: GET_SALES_AND_TRAFFIC_REPORT (salesAndTrafficByAsin)
     """
     CREATE TABLE IF NOT EXISTS sales_traffic_asin (
         month               TEXT NOT NULL,
@@ -223,7 +107,8 @@ TABLES = [
     )
     """,
 
-    # ── Search Query Performance (derived from sqp_report) ────────────────────
+    # ── Search Query Performance ──────────────────────────────────────────────
+    # Source: GET_BRAND_ANALYTICS_SEARCH_QUERY_PERFORMANCE_REPORT
     """
     CREATE TABLE IF NOT EXISTS search_query_performance (
         month                   TEXT NOT NULL,
@@ -250,7 +135,8 @@ TABLES = [
     )
     """,
 
-    # ── Catalog Performance (derived from search_catalog_performance) ─────────
+    # ── Catalog Performance ───────────────────────────────────────────────────
+    # Source: GET_BRAND_ANALYTICS_SEARCH_CATALOG_PERFORMANCE_REPORT
     """
     CREATE TABLE IF NOT EXISTS catalog_performance (
         month                   TEXT NOT NULL,
@@ -268,8 +154,43 @@ TABLES = [
     )
     """,
 
+    # ── Repeat Purchase ───────────────────────────────────────────────────────
+    # Source: GET_BRAND_ANALYTICS_REPEAT_PURCHASE_REPORT
+    """
+    CREATE TABLE IF NOT EXISTS repeat_purchase (
+        month                       TEXT NOT NULL,
+        asin                        TEXT NOT NULL,
+        period                      TEXT,
+        orders                      INTEGER,
+        unique_customers            INTEGER,
+        repeat_customers_pct        DOUBLE PRECISION,
+        repeat_purchase_revenue     DOUBLE PRECISION,
+        repeat_purchase_revenue_pct DOUBLE PRECISION,
+        pulled_at                   TEXT NOT NULL,
+        PRIMARY KEY (month, asin)
+    )
+    """,
+
+    # ── Market Basket ─────────────────────────────────────────────────────────
+    # Source: GET_BRAND_ANALYTICS_MARKET_BASKET_REPORT
+    """
+    CREATE TABLE IF NOT EXISTS market_basket (
+        month               TEXT NOT NULL,
+        asin                TEXT NOT NULL,
+        purchased_with_asin TEXT NOT NULL,
+        purchased_with_rank INTEGER,
+        combination_pct     DOUBLE PRECISION,
+        period              TEXT,
+        pulled_at           TEXT NOT NULL,
+        PRIMARY KEY (month, asin, purchased_with_asin)
+    )
+    """,
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Tier 2 — Scored tables (built by db/build_*.py)
+    # ══════════════════════════════════════════════════════════════════════════
+
     # ── Keyword Targets (built by build_keywords.py) ──────────────────────────
-    # brand_* columns = Nire Beauty metrics (dwc_* in DWC reference project)
     """
     CREATE TABLE IF NOT EXISTS keyword_targets (
         search_query        TEXT NOT NULL PRIMARY KEY,
@@ -351,6 +272,10 @@ TABLES = [
     )
     """,
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # Tier 3 — Meta tables
+    # ══════════════════════════════════════════════════════════════════════════
+
     # ── Keyword Goals (user-set targets via dashboard UI) ─────────────────────
     """
     CREATE TABLE IF NOT EXISTS keyword_goals (
@@ -399,11 +324,69 @@ TABLES = [
 ]
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Indexes — following DWC's pattern: index every column used in
+# WHERE, JOIN, GROUP BY across dashboard.py, build_*.py, and load.py.
+# ══════════════════════════════════════════════════════════════════════════════
+
+INDEXES = [
+    # Listings
+    "CREATE INDEX IF NOT EXISTS idx_listings_asin ON listings (asin)",
+
+    # Sales Traffic ASIN
+    "CREATE INDEX IF NOT EXISTS idx_sta_asin   ON sales_traffic_asin (asin)",
+    "CREATE INDEX IF NOT EXISTS idx_sta_period ON sales_traffic_asin (period)",
+    "CREATE INDEX IF NOT EXISTS idx_sta_month  ON sales_traffic_asin (month)",
+
+    # Search Terms
+    "CREATE INDEX IF NOT EXISTS idx_st_asin   ON search_terms (clicked_asin)",
+    "CREATE INDEX IF NOT EXISTS idx_st_term   ON search_terms (search_term)",
+    "CREATE INDEX IF NOT EXISTS idx_st_period ON search_terms (period)",
+    "CREATE INDEX IF NOT EXISTS idx_st_month  ON search_terms (month)",
+
+    # Search Query Performance
+    "CREATE INDEX IF NOT EXISTS idx_sqp_asin   ON search_query_performance (asin)",
+    "CREATE INDEX IF NOT EXISTS idx_sqp_query  ON search_query_performance (search_query)",
+    "CREATE INDEX IF NOT EXISTS idx_sqp_period ON search_query_performance (period)",
+    "CREATE INDEX IF NOT EXISTS idx_sqp_month  ON search_query_performance (month)",
+
+    # Catalog Performance
+    "CREATE INDEX IF NOT EXISTS idx_cp_asin   ON catalog_performance (asin)",
+    "CREATE INDEX IF NOT EXISTS idx_cp_period ON catalog_performance (period)",
+    "CREATE INDEX IF NOT EXISTS idx_cp_month  ON catalog_performance (month)",
+
+    # Repeat Purchase
+    "CREATE INDEX IF NOT EXISTS idx_rp_asin   ON repeat_purchase (asin)",
+    "CREATE INDEX IF NOT EXISTS idx_rp_period ON repeat_purchase (period)",
+    "CREATE INDEX IF NOT EXISTS idx_rp_month  ON repeat_purchase (month)",
+
+    # Market Basket
+    "CREATE INDEX IF NOT EXISTS idx_mb_asin   ON market_basket (asin)",
+    "CREATE INDEX IF NOT EXISTS idx_mb_period ON market_basket (period)",
+    "CREATE INDEX IF NOT EXISTS idx_mb_month  ON market_basket (month)",
+
+    # ASIN Keyword Scores
+    "CREATE INDEX IF NOT EXISTS idx_aks_asin     ON asin_keyword_scores (asin)",
+    "CREATE INDEX IF NOT EXISTS idx_aks_query    ON asin_keyword_scores (search_query)",
+    "CREATE INDEX IF NOT EXISTS idx_aks_role     ON asin_keyword_scores (keyword_role)",
+    "CREATE INDEX IF NOT EXISTS idx_aks_type     ON asin_keyword_scores (keyword_type)",
+    "CREATE INDEX IF NOT EXISTS idx_aks_kw_rel   ON asin_keyword_scores (keyword_relevance)",
+    "CREATE INDEX IF NOT EXISTS idx_aks_asin_pri ON asin_keyword_scores (asin_priority)",
+
+    # Keyword Targets
+    "CREATE INDEX IF NOT EXISTS idx_kt_strategy ON keyword_targets (strategy)",
+    "CREATE INDEX IF NOT EXISTS idx_kt_volume   ON keyword_targets (volume)",
+    "CREATE INDEX IF NOT EXISTS idx_kt_cvr_idx  ON keyword_targets (cvr_index)",
+]
+
+
 def init_db():
-    """Create all tables if they don't exist. Safe to call repeatedly."""
+    """Create all tables and indexes if they don't exist. Safe to call repeatedly."""
     with get_conn() as conn:
         with conn.cursor() as cur:
             for sql in TABLES:
                 cur.execute(sql)
+            for sql in INDEXES:
+                cur.execute(sql)
         conn.commit()
-    print(f'Database schema initialized ({len(TABLES)} tables).')
+    print(f'Database schema initialized ({len(TABLES)} tables, {len(INDEXES)} indexes).')

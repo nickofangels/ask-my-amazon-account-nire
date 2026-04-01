@@ -4,30 +4,61 @@ db/utils.py — Shared utilities for the build pipeline.
 Imported by build_asin_keywords.py and build_keywords.py to ensure a
 single source of truth for keyword classification, percentile ranking,
 and trend-window computation.
+
+Brand-specific keyword classification is driven by environment variables
+so this project can be ported to any brand without code changes:
+
+    BRANDED_TERMS     — comma-separated phrases (e.g. "nire beauty,nire brush")
+    BRANDED_EXACT     — comma-separated exact matches (e.g. "nire")
+    BRANDED_COMBOS    — pipe-separated groups of AND terms (e.g. "nire+brush")
+    COMPETITOR_TERMS  — comma-separated competitor phrases (e.g. "sigma,morphe")
 """
 from __future__ import annotations
 
+import os
 from datetime import date
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 
 # ---------------------------------------------------------------------------
-# Keyword type constants and classifier — Nire Beauty (makeup brushes)
+# Keyword type constants — loaded from environment
 # ---------------------------------------------------------------------------
 
-BRANDED_TERMS = [
-    "nire beauty", "nire brush", "nire makeup",
-]
-BRANDED_EXACT = {"nire"}
+def _csv(key: str) -> list[str]:
+    """Read a comma-separated env var, stripping whitespace."""
+    val = os.environ.get(key, "").strip()
+    return [t.strip() for t in val.split(",") if t.strip()] if val else []
 
-BRANDED_COMBOS: list[tuple[str, ...]] = [
-    ("nire", "brush"),
-]
 
-COMPETITOR_TERMS = [
-    "real techniques", "sigma", "morphe", "bh cosmetics",
-    "jessup", "bs-mall", "bs mall", "docolor", "bestope",
-    "lamora", "eigshow", "ducare", "anne's giverny",
-]
+def _combos(key: str) -> list[tuple[str, ...]]:
+    """Read pipe-separated AND-groups: 'a+b|c+d' -> [('a','b'), ('c','d')]."""
+    val = os.environ.get(key, "").strip()
+    if not val:
+        return []
+    groups = []
+    for group in val.split("|"):
+        terms = tuple(t.strip() for t in group.split("+") if t.strip())
+        if terms:
+            groups.append(terms)
+    return groups
+
+
+BRANDED_TERMS: list[str] = _csv("BRANDED_TERMS")
+BRANDED_EXACT: set[str] = set(_csv("BRANDED_EXACT"))
+BRANDED_COMBOS: list[tuple[str, ...]] = _combos("BRANDED_COMBOS")
+COMPETITOR_TERMS: list[str] = _csv("COMPETITOR_TERMS")
+
+# Warn at import time if no brand config is set (likely a new project)
+if not BRANDED_TERMS and not BRANDED_EXACT:
+    import warnings
+    warnings.warn(
+        "No BRANDED_TERMS or BRANDED_EXACT set in .env — all keywords will be "
+        "classified as 'category'. Set these for proper keyword classification.",
+        stacklevel=2,
+    )
 
 
 def keyword_type(query: str) -> str:

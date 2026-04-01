@@ -816,16 +816,16 @@ def api_keyword_stats():
 def api_highlights():
     conn = _conn()
 
-    # Daily-average traffic/sales (normalise by day count so L52's shorter run is fair)
+    # Traffic/sales aggregates from per-ASIN monthly data
     daily = {r["period"]: r for r in _rows(conn, """
         SELECT period,
-               COUNT(*) AS day_count,
+               COUNT(DISTINCT month) AS day_count,
                SUM(revenue)           AS total_revenue,
                SUM(units)             AS total_units,
                SUM(sessions)          AS total_sessions,
                AVG(conversion_rate)   AS avg_cvr,
                AVG(buy_box_pct)       AS avg_buy_box
-        FROM sales_traffic_daily
+        FROM sales_traffic_asin
         WHERE period IN ('L52','P52')
         GROUP BY period
     """)}
