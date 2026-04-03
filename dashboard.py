@@ -1,9 +1,10 @@
 """
-Nire Beauty Analytics Dashboard — http://localhost:5050
+Nire Beauty Analytics Dashboard — http://localhost:5052
 Tabs: Overview | Products | Search Funnel | Search Terms | ASIN Explorer
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -179,7 +180,7 @@ def api_products():
         LEFT JOIN listings l ON a.asin = l.asin
         WHERE a.period IN ('L52','P52')
           AND (a.period = 'P52' OR (a.month >= %s AND a.month <= %s))
-        GROUP BY a.asin
+        GROUP BY a.asin, l.product_name
     """, date_params)
 
     catalog = {}
@@ -258,7 +259,7 @@ def api_movers():
         FROM sales_traffic_asin a
         LEFT JOIN listings l ON a.asin = l.asin
         WHERE a.period IN ('L52','P52')
-        GROUP BY a.asin
+        GROUP BY a.asin, l.product_name
     """
     rows = _rows(conn, pivot_sql)
     conn.close()
@@ -511,9 +512,20 @@ def api_keywords():
                kt.brand_ctr, kt.mkt_ctr, kt.ctr_index,
                kt.hero_asin, kt.hero_cvr, kt.hero_aov,
                kt.share_trend, kt.months_of_data,
-               kg.target_purchase_share, kg.priority, kg.notes
+               kg.target_purchase_share, kg.priority, kg.notes,
+               ads.ad_spend, ads.ad_clicks, ads.ad_sales, ads.ad_acos
         FROM keyword_targets kt
         LEFT JOIN keyword_goals kg ON kt.search_query = kg.search_query
+        LEFT JOIN (
+            SELECT LOWER(customer_search_term) AS term,
+                   SUM(spend)  AS ad_spend,
+                   SUM(clicks) AS ad_clicks,
+                   SUM(sales)  AS ad_sales,
+                   CASE WHEN SUM(sales) > 0
+                        THEN SUM(spend) / SUM(sales) END AS ad_acos
+            FROM ads_search_terms
+            GROUP BY LOWER(customer_search_term)
+        ) ads ON LOWER(kt.search_query) = ads.term
         {where}
         ORDER BY {order_clause}
         LIMIT %s
@@ -1027,6 +1039,253 @@ def api_highlights_movers():
     return jsonify(result)
 
 
+# ---------------------------------------------------------------------------
+# API — Advertising endpoints
+# ---------------------------------------------------------------------------
+
+@app.route("/api/revenue-by-month")
+def api_revenue_by_month():
+    conn = _conn()
+    rows = _rows(conn, """
+        SELECT month, SUM(revenue) AS revenue
+        FROM sales_traffic_asin
+        GROUP BY month ORDER BY month
+    """)
+    conn.close()
+    return jsonify(rows)
+
+@app.route("/api/ads/summary")
+def api_ads_summary():
+    conn = _conn()
+    rows = _rows(conn, """
+        SELECT ad_type, attribution_window,
+               COUNT(*)            AS campaigns,
+               SUM(spend)          AS spend,
+               SUM(impressions)    AS impressions,
+               SUM(clicks)         AS clicks,
+               SUM(orders)         AS orders,
+               SUM(sales)          AS sales,
+               CASE WHEN SUM(sales) > 0
+                    THEN SUM(spend) / SUM(sales) END AS acos,
+               CASE WHEN SUM(spend) > 0
+                    THEN SUM(sales) / SUM(spend) END AS roas,
+               CASE WHEN SUM(impressions) > 0
+                    THEN SUM(clicks)::float / SUM(impressions) END AS ctr,
+               CASE WHEN SUM(clicks) > 0
+                    THEN SUM(spend) / SUM(clicks) END AS cpc
+        FROM ads_campaigns
+        GROUP BY ad_type, attribution_window
+        ORDER BY ad_type
+    """)
+    conn.close()
+    return jsonify(rows)
+
+
+@app.route("/api/ads/summary/monthly")
+def api_ads_summary_monthly():
+    """Per-month campaign-level totals for client-side horizon slicing."""
+    conn = _conn()
+    rows = _rows(conn, """
+        SELECT month,
+               COUNT(*)         AS campaigns,
+               SUM(spend)       AS spend,
+               SUM(impressions) AS impressions,
+               SUM(clicks)      AS clicks,
+               SUM(orders)      AS orders,
+               SUM(sales)       AS sales
+        FROM ads_campaigns
+        GROUP BY month
+        ORDER BY month
+    """)
+    conn.close()
+    return jsonify(rows)
+
+
+@app.route("/api/ads/keywords/monthly")
+def api_ads_keywords_monthly():
+    """Per-(keyword, month) ad data for client-side horizon slicing."""
+    conn = _conn()
+    rows = _rows(conn, """
+        SELECT LOWER(customer_search_term) AS search_term, month,
+               SUM(spend)       AS ad_spend,
+               SUM(impressions) AS ad_impressions,
+               SUM(clicks)      AS ad_clicks,
+               SUM(orders)      AS ad_orders,
+               SUM(units)       AS ad_units,
+               SUM(sales)       AS ad_sales,
+               COUNT(DISTINCT campaign_name) AS num_campaigns,
+               STRING_AGG(DISTINCT ad_type, ',') AS ad_type_list,
+               MIN(impression_rank)  AS best_impression_rank,
+               MAX(impression_share) AS best_impression_share
+        FROM ads_search_terms
+        GROUP BY LOWER(customer_search_term), month
+        ORDER BY search_term, month
+    """)
+    conn.close()
+    return jsonify(rows)
+
+
+@app.route("/api/ads/keywords")
+def api_ads_keywords():
+    """Level 1: keyword-level aggregated view with organic data joined."""
+    conn = _conn()
+    sort = request.args.get("sort", "ad_spend")
+    strategy = request.args.get("strategy", "")
+    ad_type = request.args.get("ad_type", "")
+    limit = int(request.args.get("limit", 500))
+
+    allowed_sorts = {
+        "ad_spend":      "a.ad_spend DESC NULLS LAST",
+        "ad_sales":      "a.ad_sales DESC NULLS LAST",
+        "ad_acos":       "a.ad_acos ASC NULLS LAST",
+        "ad_roas":       "a.ad_roas DESC NULLS LAST",
+        "ad_clicks":     "a.ad_clicks DESC NULLS LAST",
+        "impressions":   "a.ad_impressions DESC NULLS LAST",
+        "organic_volume":"kt.volume DESC NULLS LAST",
+        "cvr_index":     "kt.cvr_index DESC NULLS LAST",
+    }
+    order_clause = allowed_sorts.get(sort, "a.ad_spend DESC NULLS LAST")
+
+    where_parts = []
+    params: list = []
+    if strategy and strategy != "All":
+        where_parts.append("kt.strategy = %s")
+        params.append(strategy)
+    if ad_type and ad_type != "All":
+        where_parts.append("a.ad_type_list LIKE %s")
+        params.append(f"%{ad_type}%")
+    where = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
+
+    sql = f"""
+        WITH ad_agg AS (
+            SELECT
+                LOWER(customer_search_term) AS search_term,
+                STRING_AGG(DISTINCT ad_type, ',') AS ad_type_list,
+                SUM(spend)       AS ad_spend,
+                SUM(impressions) AS ad_impressions,
+                SUM(clicks)      AS ad_clicks,
+                SUM(orders)      AS ad_orders,
+                SUM(sales)       AS ad_sales,
+                CASE WHEN SUM(sales) > 0
+                     THEN SUM(spend) / SUM(sales) END AS ad_acos,
+                CASE WHEN SUM(spend) > 0
+                     THEN SUM(sales) / SUM(spend) END AS ad_roas,
+                COUNT(DISTINCT campaign_name) AS num_campaigns,
+                MIN(impression_rank)  AS best_impression_rank,
+                MAX(impression_share) AS best_impression_share
+            FROM ads_search_terms
+            GROUP BY LOWER(customer_search_term)
+        )
+        SELECT a.search_term, a.ad_type_list, a.ad_spend, a.ad_impressions,
+               a.ad_clicks, a.ad_orders, a.ad_sales, a.ad_acos, a.ad_roas,
+               a.num_campaigns, a.best_impression_rank, a.best_impression_share,
+               kt.volume AS organic_volume, kt.strategy,
+               kt.keyword_type, kt.brand_purchase_share AS organic_purchase_share,
+               kt.cvr_index, kt.brand_cvr AS organic_cvr,
+               kt.share_trend, kt.vol_tier,
+               kt.brand_clicks AS organic_clicks,
+               kt.brand_purchases AS organic_purchases
+        FROM ad_agg a
+        LEFT JOIN keyword_targets kt ON a.search_term = LOWER(kt.search_query)
+        {where}
+        ORDER BY {order_clause}
+        LIMIT %s
+    """
+    params.append(limit)
+    rows = _rows(conn, sql, params)
+    conn.close()
+    return jsonify(rows)
+
+
+@app.route("/api/ads/keyword/<path:term>/products")
+def api_ads_keyword_products(term: str):
+    """Level 2: per-ASIN breakdown for a keyword."""
+    conn = _conn()
+    rows = _rows(conn, """
+        WITH ad_by_asin AS (
+            SELECT
+                ap.asin,
+                SUM(ast.spend)   AS ad_spend,
+                SUM(ast.clicks)  AS ad_clicks,
+                SUM(ast.orders)  AS ad_orders,
+                SUM(ast.sales)   AS ad_sales,
+                CASE WHEN SUM(ast.sales) > 0
+                     THEN SUM(ast.spend) / SUM(ast.sales) END AS ad_acos,
+                SUM(ast.own_sku_sales)   AS own_sku_sales,
+                SUM(ast.other_sku_sales) AS other_sku_sales,
+                COUNT(DISTINCT ast.campaign_name) AS num_campaigns,
+                STRING_AGG(DISTINCT ast.ad_type, ',') AS ad_types
+            FROM ads_search_terms ast
+            JOIN ads_products ap
+              ON ast.campaign_name = ap.campaign_name
+             AND ast.ad_group_name = ap.ad_group_name
+             AND ast.ad_type = ap.ad_type
+             AND ast.month = ap.month
+            WHERE LOWER(ast.customer_search_term) = LOWER(%s)
+            GROUP BY ap.asin
+        )
+        SELECT a.asin, a.ad_spend, a.ad_clicks, a.ad_orders, a.ad_sales,
+               a.ad_acos, a.own_sku_sales, a.other_sku_sales,
+               a.num_campaigns, a.ad_types,
+               (SELECT product_name FROM listings WHERE asin = a.asin LIMIT 1) AS product_name,
+               s.keyword_relevance, s.asin_priority, s.keyword_role,
+               s.purchase_share AS organic_purchase_share,
+               s.cvr_index, s.asin_cvr, s.adjusted_cvr, s.mkt_cvr,
+               s.revenue_score, s.share_trend
+        FROM ad_by_asin a
+        LEFT JOIN asin_keyword_scores s
+          ON a.asin = s.asin AND LOWER(s.search_query) = LOWER(%s)
+        ORDER BY a.ad_spend DESC
+    """, (term, term))
+    conn.close()
+    return jsonify(rows)
+
+
+@app.route("/api/ads/keyword/<path:term>/product/<asin>/campaigns")
+def api_ads_keyword_product_campaigns(term: str, asin: str):
+    """Level 3: campaign-level detail for a keyword + ASIN."""
+    asin = asin.strip().upper()
+    conn = _conn()
+    rows = _rows(conn, """
+        SELECT ast.campaign_name, ast.ad_type, ast.match_type,
+               ast.ad_group_name, ast.targeting_text,
+               ast.spend, ast.cpc, ast.clicks, ast.impressions,
+               ast.orders, ast.sales, ast.acos, ast.roas,
+               ast.impression_rank, ast.impression_share,
+               ast.cvr
+        FROM ads_search_terms ast
+        JOIN ads_products ap
+          ON ast.campaign_name = ap.campaign_name
+         AND ast.ad_group_name = ap.ad_group_name
+         AND ast.ad_type = ap.ad_type
+         AND ast.month = ap.month
+        WHERE LOWER(ast.customer_search_term) = LOWER(%s)
+          AND ap.asin = %s
+        ORDER BY ast.spend DESC
+    """, (term, asin))
+    conn.close()
+    return jsonify(rows)
+
+
+@app.route("/api/ads/campaigns")
+def api_ads_campaigns():
+    conn = _conn()
+    rows = _rows(conn, """
+        SELECT campaign_name, ad_type, attribution_window, status,
+               portfolio_name, budget, spend, impressions, clicks,
+               ctr, cpc, orders, units, sales, acos, roas,
+               bidding_strategy, targeting_type,
+               avg_time_in_budget, recommended_budget,
+               est_missed_imp_lower, est_missed_imp_upper,
+               est_missed_sales_lower, est_missed_sales_upper,
+               ntb_orders, ntb_sales, branded_searches
+        FROM ads_campaigns
+        ORDER BY spend DESC NULLS LAST
+    """)
+    conn.close()
+    return jsonify(rows)
+
+
 @app.route("/api/asins")
 def api_asins():
     conn = _conn()
@@ -1195,7 +1454,7 @@ nav button.active{background:var(--surface2);color:var(--blue)}
 table{width:100%;border-collapse:collapse;font-size:0.82rem}
 th{text-align:left;padding:8px 12px;color:var(--muted);font-weight:500;font-size:0.72rem;text-transform:uppercase;letter-spacing:.06em;border-bottom:1px solid var(--border);white-space:nowrap;cursor:pointer;user-select:none}
 th:hover{color:var(--text)}
-th.sort-asc::after{content:" \u2191"}th.sort-desc::after{content:" \u2193"}
+th.sort-asc::after{content:" ▲";color:var(--blue);font-weight:700}th.sort-desc::after{content:" ▼";color:var(--blue);font-weight:700}
 td{padding:8px 12px;border-bottom:1px solid #1a1f2e;vertical-align:middle}
 tr:hover td{background:var(--surface2)}
 .num{text-align:right;font-variant-numeric:tabular-nums}
@@ -1356,6 +1615,7 @@ tr:hover td{background:var(--surface2)}
     <button onclick="showTab('search')">Search Terms</button>
     <button onclick="showTab('explorer')">ASIN Explorer</button>
     <button onclick="showTab('keywords')">Keywords</button>
+    <button onclick="showTab('advertising')">Advertising</button>
   </nav>
 </div>
 
@@ -1732,10 +1992,167 @@ tr:hover td{background:var(--surface2)}
 
   </div>
 
+  <!-- ===== ADVERTISING ===== -->
+  <div id="tab-advertising" class="tab-panel">
+
+    <!-- KPI cards -->
+    <div class="kw-kpi-grid" id="ads-kpi-grid"><div class="loading">Loading...</div></div>
+
+    <!-- Shared filters -->
+    <div class="kw-filter-bar">
+      <div class="kw-filter-row">
+        <span class="kw-filter-label">Search</span>
+        <input type="text" id="ads-kw-search" placeholder="Filter keywords..." oninput="filterAdsKeywords()">
+      </div>
+      <div class="kw-filter-row">
+        <span class="kw-filter-label">Strategy</span>
+        <span id="ads-strategy-chips" style="display:contents">
+        <span class="chip active" data-adstrat="All"           onclick="setChipFilter('ads-strategy-chips',this);filterAdsKeywords()">All</span>
+        <span class="chip chip-branded" data-adstrat="Branded" onclick="setChipFilter('ads-strategy-chips',this);filterAdsKeywords()">Branded</span>
+        <span class="chip chip-defend"  data-adstrat="Defend"  onclick="setChipFilter('ads-strategy-chips',this);filterAdsKeywords()">Defend</span>
+        <span class="chip chip-grow"    data-adstrat="Grow"    onclick="setChipFilter('ads-strategy-chips',this);filterAdsKeywords()">Grow</span>
+        <span class="chip chip-watch"   data-adstrat="Watch"   onclick="setChipFilter('ads-strategy-chips',this);filterAdsKeywords()">Watch</span>
+        <span class="chip chip-deprioritize" data-adstrat="Deprioritize" onclick="setChipFilter('ads-strategy-chips',this);filterAdsKeywords()">Deprioritize</span>
+        <span class="chip" data-adstrat="" onclick="setChipFilter('ads-strategy-chips',this);filterAdsKeywords()">No Organic</span>
+        </span>
+        <span style="width:1px;height:16px;background:var(--border);margin:0 6px"></span>
+        <span class="kw-filter-label" style="min-width:auto">Ad Type</span>
+        <span id="ads-adtype-chips" style="display:contents">
+        <span class="chip active" data-adtype="All" onclick="setChipFilter('ads-adtype-chips',this);filterAdsKeywords()">All</span>
+        <span class="chip" data-adtype="SP" onclick="setChipFilter('ads-adtype-chips',this);filterAdsKeywords()">SP</span>
+        <span class="chip" data-adtype="SB" onclick="setChipFilter('ads-adtype-chips',this);filterAdsKeywords()">SB</span>
+        <span class="chip" data-adtype="SD" onclick="setChipFilter('ads-adtype-chips',this);filterAdsKeywords()">SD</span>
+        </span>
+      </div>
+    </div>
+
+    <!-- Two-panel filters: Ad Data (left) | SQP / Organic (right) -->
+    <div class="two-col" style="margin-bottom:16px">
+      <div class="kw-filter-bar" style="margin-bottom:0;position:relative">
+        <div style="font-size:0.72rem;font-weight:700;color:var(--blue);text-transform:uppercase;letter-spacing:.08em;margin-bottom:2px">Ad Data</div>
+        <div class="kw-filter-row" style="opacity:0.4;pointer-events:none">
+          <span class="kw-filter-label">Window</span>
+          <button class="kw-horizon-btn active" data-adwindow="L1M">L1M</button>
+          <button class="kw-horizon-btn" data-adwindow="L3M">L3M</button>
+          <button class="kw-horizon-btn" data-adwindow="L6M">L6M</button>
+          <button class="kw-horizon-btn" data-adwindow="ALL">All</button>
+          <span class="kw-horizon-period" id="ads-period-label"></span>
+        </div>
+        <div style="font-size:0.7rem;color:var(--yellow);font-style:italic;margin:-2px 0 4px">
+          &#9888; Only Feb 2026 available &mdash; more months coming soon
+        </div>
+        <div class="kw-filter-row">
+          <span class="kw-filter-label">Min Clicks</span>
+          <select id="ads-clicks-filter" onchange="filterAdsKeywords()">
+            <option value="0">Any</option>
+            <option value="10">10+ clicks</option>
+            <option value="25">25+ clicks</option>
+            <option value="50">50+ clicks</option>
+            <option value="100">100+ clicks</option>
+          </select>
+          <span class="kw-filter-count" id="ads-filter-count"></span>
+        </div>
+      </div>
+      <div class="kw-filter-bar" style="margin-bottom:0">
+        <div style="font-size:0.72rem;font-weight:700;color:var(--cyan);text-transform:uppercase;letter-spacing:.08em;margin-bottom:2px">SQP / Organic</div>
+        <div class="kw-filter-row">
+          <span class="kw-filter-label">Window</span>
+          <button class="kw-horizon-btn active" data-sqpwindow="L1M"  onclick="setSqpHorizon(this)">L1M</button>
+          <button class="kw-horizon-btn" data-sqpwindow="L3M"  onclick="setSqpHorizon(this)">L3M</button>
+          <button class="kw-horizon-btn" data-sqpwindow="L6M"  onclick="setSqpHorizon(this)">L6M</button>
+          <button class="kw-horizon-btn" data-sqpwindow="ALL"  onclick="setSqpHorizon(this)">All</button>
+          <span class="kw-horizon-period" id="sqp-period-label"></span>
+        </div>
+        <div class="kw-filter-row">
+          <span class="kw-filter-label">Min Clicks</span>
+          <select id="sqp-clicks-filter" onchange="filterAdsKeywords()">
+            <option value="0">Any</option>
+            <option value="10">10+ clicks</option>
+            <option value="25">25+ clicks</option>
+            <option value="50">50+ clicks</option>
+            <option value="100">100+ clicks</option>
+            <option value="250">250+ clicks</option>
+          </select>
+        </div>
+      </div>
+    </div>
+    <p style="color:var(--dim);font-size:0.7rem;margin:0 0 8px">
+      SP uses 7-day attribution; SB/SD use 14-day. Click a keyword to drill down.
+    </p>
+
+    <!-- Level 1: Keyword table -->
+    <div class="card">
+      <div class="card-title">Keyword Performance</div>
+      <div class="tbl-wrap">
+        <table id="ads-kw-table">
+          <thead><tr>
+            <th data-adcol="search_term">Search Term</th>
+            <th data-adcol="ad_type_list">Ad Type</th>
+            <th data-adcol="ad_spend" class="num">Ad Spend</th>
+            <th data-adcol="ad_clicks" class="num">Ad Clicks</th>
+            <th data-adcol="ad_sales" class="num sort-desc">Ad Sales</th>
+            <th data-adcol="ad_acos" class="num">ACOS</th>
+            <th data-adcol="ad_roas" class="num">ROAS</th>
+            <th data-adcol="num_campaigns" class="num">Campaigns</th>
+            <th data-adcol="best_impression_share" class="num">Imp Share</th>
+            <th data-adcol="strategy">Strategy</th>
+            <th data-adcol="organic_volume" class="num">Org Volume</th>
+            <th data-adcol="organic_units" class="num">Org Units</th>
+            <th data-adcol="cvr_index" class="num">CVR Index</th>
+          </tr></thead>
+          <tbody id="ads-kw-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Level 2: Product drill-down (shown on keyword click) -->
+    <div class="tracker-wrap" id="ads-product-detail">
+      <div class="tracker-title" id="ads-product-header"></div>
+      <div class="tbl-wrap">
+        <table id="ads-product-table">
+          <thead><tr>
+            <th>ASIN</th>
+            <th>Product</th>
+            <th class="num">Ad Spend</th>
+            <th class="num">Ad Sales</th>
+            <th class="num">ACOS</th>
+            <th class="num">Campaigns</th>
+            <th>Role</th>
+            <th class="num">Org Share</th>
+            <th class="num">CVR Index</th>
+          </tr></thead>
+          <tbody id="ads-product-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Level 3: Campaign drill-down (shown on product click) -->
+    <div class="allocation-wrap" id="ads-campaign-detail">
+      <div class="allocation-title" id="ads-campaign-header"></div>
+      <div class="tbl-wrap">
+        <table id="ads-campaign-table">
+          <thead><tr>
+            <th>Campaign</th>
+            <th>Type</th>
+            <th>Match</th>
+            <th class="num">Spend</th>
+            <th class="num">CPC</th>
+            <th class="num">Clicks</th>
+            <th class="num">Orders</th>
+            <th class="num">ACOS</th>
+            <th class="num">Imp Share</th>
+          </tr></thead>
+          <tbody id="ads-campaign-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+  </div>
+
 </div>
 
 <script>
-const TABS = ['overview','highlights','products','search','explorer','keywords'];
+const TABS = ['overview','highlights','products','search','explorer','keywords','advertising'];
 const loaded = {};
 function showTab(name) {
   document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
@@ -1753,6 +2170,7 @@ function initTab(name) {
   if (name === 'search')      loadSearch();
   if (name === 'explorer')    initExplorer();
   if (name === 'keywords')    loadKeywords();
+  if (name === 'advertising') loadAdvertising();
 }
 
 const fmt$ = v => '$' + (+v).toLocaleString('en-US', {minimumFractionDigits:0, maximumFractionDigits:0});
@@ -3342,6 +3760,388 @@ function navigateToAsin(asin) {
 }
 
 // Boot
+// ─── Advertising Tab ──────────────────────────────────────────────────────
+let _adsKwData = [];
+let _adsCurrentTerm = null;
+let _monthlyRevenue = {};       // month -> revenue
+let _adsMonthlyByTerm = {};     // search_term -> [{month, ad_spend, ...}, ...]
+let _adsSummaryMonthly = [];    // [{month, spend, clicks, ...}, ...]
+let _adsAllMonths = [];         // sorted months present in ad data
+let _adsSelectedMonths = [];    // months currently selected in the ad picker
+let _sqpAllMonths = [];         // sorted months present in SQP data
+let _sqpSelectedMonths = [];    // months currently selected in the SQP picker
+let adsSortCol = 'ad_sales';
+let adsSortDir = -1;
+
+function sortAdsTable(col) {
+  if (adsSortCol === col) { adsSortDir *= -1; }
+  else { adsSortCol = col; adsSortDir = -1; }
+  document.querySelectorAll('#ads-kw-table th').forEach(th => {
+    th.classList.remove('sort-asc','sort-desc');
+    if (th.dataset.adcol === col) th.classList.add(adsSortDir === -1 ? 'sort-desc' : 'sort-asc');
+  });
+  filterAdsKeywords();
+}
+
+function _adsWindowMonths(period) {
+  if (!_adsAllMonths.length) return _adsAllMonths;
+  const n = period === 'L1M' ? 1 : period === 'L3M' ? 3 : period === 'L6M' ? 6 : _adsAllMonths.length;
+  return _adsAllMonths.slice(-n);
+}
+
+function _sqpWindowMonths(period) {
+  if (!kwAllMonths.length) return kwAllMonths;
+  const n = period === 'L1M' ? 1 : period === 'L3M' ? 3 : period === 'L6M' ? 6 : kwAllMonths.length;
+  return kwAllMonths.slice(-n);
+}
+
+let _adsWindowPeriod = 'L1M';
+let _sqpWindowPeriod = 'L1M';
+
+function setAdsHorizon(btn) {
+  document.querySelectorAll('[data-adwindow]').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  _adsWindowPeriod = btn.dataset.adwindow;
+  _adsSelectedMonths = _adsWindowMonths(_adsWindowPeriod);
+  recomputeAdsOrganic();
+  recomputeAdsSummary();
+  filterAdsKeywords();
+}
+
+function setSqpHorizon(btn) {
+  document.querySelectorAll('[data-sqpwindow]').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  _sqpWindowPeriod = btn.dataset.sqpwindow;
+  _sqpSelectedMonths = _sqpWindowMonths(_sqpWindowPeriod);
+  recomputeAdsOrganic();
+  filterAdsKeywords();
+}
+
+function _initAdsHorizons() {
+  _adsSelectedMonths = _adsWindowMonths(_adsWindowPeriod);
+  _sqpSelectedMonths = _sqpWindowMonths(_sqpWindowPeriod);
+}
+
+function recomputeAdsOrganic() {
+  // Update ad period label
+  const adSet = new Set(_adsSelectedMonths);
+  const adSorted = [...adSet].sort();
+  const adLabel = adSorted.length ? adSorted[0] + ' \u2014 ' + adSorted[adSorted.length-1] : 'none selected';
+  const adEl = document.getElementById('ads-period-label');
+  if (adEl) adEl.textContent = adLabel;
+
+  // Update SQP period label
+  const sqpSet = new Set(_sqpSelectedMonths);
+  const sqpSorted = [...sqpSet].sort();
+  const sqpLabel = sqpSorted.length ? sqpSorted[0] + ' \u2014 ' + sqpSorted[sqpSorted.length-1] : 'none selected';
+  const sqpEl = document.getElementById('sqp-period-label');
+  if (sqpEl) sqpEl.textContent = sqpLabel;
+
+  const allTerms = Object.keys(_adsMonthlyByTerm);
+
+  _adsKwData = allTerms.map(term => {
+    // Ad rows filtered to ad-selected months
+    const adRows = (_adsMonthlyByTerm[term] || []).filter(m => adSet.has(m.month));
+    // Full SQP rows filtered to SQP-selected months (for CVR index, volume)
+    const sqpRowsFull = (kwMonthlyData[term] || []).filter(m => sqpSet.has(m.month));
+
+    // Overlap: intersection of ad-selected and sqp-selected months where BOTH have data
+    const adMonthSet  = new Set(adRows.map(m => m.month));
+    const sqpMonthSet = new Set(sqpRowsFull.map(m => m.month));
+    const overlapMonths = new Set([...adMonthSet].filter(m => sqpMonthSet.has(m)));
+
+    // Ad metrics over ad-selected months (unchanged)
+    const ad_spend  = adRows.reduce((s,m) => s + (m.ad_spend||0), 0);
+    const ad_impressions = adRows.reduce((s,m) => s + (m.ad_impressions||0), 0);
+    const ad_clicks = adRows.reduce((s,m) => s + (m.ad_clicks||0), 0);
+    const ad_orders = adRows.reduce((s,m) => s + (m.ad_orders||0), 0);
+    const ad_sales  = adRows.reduce((s,m) => s + (m.ad_sales||0), 0);
+    const ad_acos   = ad_sales > 0 ? ad_spend / ad_sales : null;
+    const ad_roas   = ad_spend > 0 ? ad_sales / ad_spend : null;
+    const num_campaigns = Math.max(...adRows.map(m => m.num_campaigns||0), 0);
+    const ad_type_set = new Set();
+    adRows.forEach(m => { if (m.ad_type_list) m.ad_type_list.split(',').forEach(t => ad_type_set.add(t)); });
+    const ad_type_list = [...ad_type_set].sort().join(',');
+    const best_impression_rank  = Math.min(...adRows.map(m => m.best_impression_rank).filter(v => v != null), Infinity);
+    const best_impression_share = Math.max(...adRows.map(m => m.best_impression_share).filter(v => v != null), -Infinity);
+
+    // Full SQP metrics from SQP-selected months (CVR index, volume)
+    let volume = null, cvr_index = null, sqp_brand_clicks = null;
+    if (sqpRowsFull.length > 0) {
+      volume = sqpRowsFull.reduce((s,m) => s + (m.volume||0), 0);
+      const brand_clicks = sqpRowsFull.reduce((s,m) => s + (m.brand_clicks||0), 0);
+      sqp_brand_clicks = brand_clicks;
+      const brand_purchases = sqpRowsFull.reduce((s,m) => s + (m.brand_purchases||0), 0);
+      const mkt_clicks = sqpRowsFull.reduce((s,m) => s + (m.mkt_clicks||0), 0);
+      const mkt_purchases = sqpRowsFull.reduce((s,m) => s + (m.mkt_purchases||0), 0);
+      const brand_cvr = brand_clicks > 0 ? brand_purchases / brand_clicks * 100 : null;
+      const mkt_cvr = mkt_clicks > 0 ? mkt_purchases / mkt_clicks * 100 : null;
+      cvr_index = (brand_cvr != null && mkt_cvr > 0) ? brand_cvr / mkt_cvr : null;
+    }
+
+    // Organic units = SQP brand_purchases - ad_units using ONLY overlap months
+    let organic_units = null, organic_clicks = null, organic_cvr = null;
+    if (overlapMonths.size > 0) {
+      const overlapSqp = sqpRowsFull.filter(m => overlapMonths.has(m.month));
+      const overlapAds = adRows.filter(m => overlapMonths.has(m.month));
+      const sqp_clicks    = overlapSqp.reduce((s,m) => s + (m.brand_clicks||0), 0);
+      const sqp_purchases = overlapSqp.reduce((s,m) => s + (m.brand_purchases||0), 0);
+      const overlap_ad_units = overlapAds.reduce((s,m) => s + (m.ad_units||0), 0);
+      organic_units  = Math.max(0, sqp_purchases - overlap_ad_units);
+      organic_clicks = Math.max(0, sqp_clicks - overlapAds.reduce((s,m) => s + (m.ad_clicks||0), 0));
+      organic_cvr = organic_clicks > 0 ? organic_units / organic_clicks * 100 : null;
+    }
+
+    const strategy = _adsStrategyByTerm[term] || null;
+    const keyword_type = _adsKwTypeByTerm[term] || null;
+
+    return {
+      search_term: term, ad_type_list, ad_spend, ad_impressions, ad_clicks,
+      ad_orders, ad_sales, ad_acos, ad_roas, num_campaigns,
+      best_impression_rank: best_impression_rank === Infinity ? null : best_impression_rank,
+      best_impression_share: best_impression_share === -Infinity ? null : best_impression_share,
+      organic_volume: volume != null ? Math.round(volume) || null : null,
+      sqp_brand_clicks: sqp_brand_clicks || null,
+      organic_units, organic_clicks: organic_clicks || null, organic_cvr,
+      cvr_index, strategy, keyword_type
+    };
+  });
+}
+
+function recomputeAdsSummary() {
+  const selectedSet = new Set(_adsSelectedMonths);
+  const filtered = _adsSummaryMonthly.filter(m => selectedSet.has(m.month));
+
+  let totalSpend=0, totalSales=0, totalClicks=0, totalImpressions=0, totalOrders=0;
+  filtered.forEach(r => {
+    totalSpend += r.spend||0; totalSales += r.sales||0;
+    totalClicks += r.clicks||0; totalImpressions += r.impressions||0;
+    totalOrders += r.orders||0;
+  });
+
+  // TACOS: revenue from the same months that have ad data
+  let totalRevenue = 0;
+  selectedSet.forEach(m => { totalRevenue += _monthlyRevenue[m] || 0; });
+  const tacos = totalRevenue > 0 ? (totalSpend / totalRevenue * 100).toFixed(1) + '%' : '--';
+  const acos = totalSales > 0 ? (totalSpend / totalSales * 100).toFixed(1) + '%' : '--';
+  const roas = totalSpend > 0 ? (totalSales / totalSpend).toFixed(2) + 'x' : '--';
+  const acosColor = totalSales > 0 && totalSpend/totalSales <= 0.25 ? 'var(--green)' : totalSales > 0 && totalSpend/totalSales <= 0.40 ? 'var(--yellow)' : 'var(--red)';
+  const grid = document.getElementById('ads-kpi-grid');
+  grid.innerHTML = `
+    <div class="kpi-card">
+      <div class="kpi-label">Total Ad Spend</div>
+      <div class="kpi-l52">${fmt$(totalSpend)}</div>
+      <div class="kpi-p52">${filtered.length} month${filtered.length!==1?'s':''}</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Total Ad Sales</div>
+      <div class="kpi-l52">${fmt$(totalSales)}</div>
+      <div class="kpi-p52">${fmtN(totalOrders)} orders</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Blended ACOS</div>
+      <div class="kpi-l52" style="color:${acosColor}">${acos}</div>
+      <div class="kpi-p52">Ad Spend / Ad Sales</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">TACOS</div>
+      <div class="kpi-l52" style="color:var(--blue)">${tacos}</div>
+      <div class="kpi-p52">${fmt$(totalSpend)} spend / ${fmt$(totalRevenue)} revenue</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Blended ROAS</div>
+      <div class="kpi-l52">${roas}</div>
+      <div class="kpi-p52">${fmtN(totalClicks)} clicks | ${fmtN(totalImpressions)} impr.</div>
+    </div>
+  `;
+}
+
+let _adsStrategyByTerm = {};
+let _adsKwTypeByTerm = {};
+
+async function loadAdvertising() {
+  // Ensure monthly SQP data is loaded (shared with Keywords tab)
+  if (!kwAllMonths.length) {
+    const monthly = await fetch('/api/keywords/monthly').then(r => r.json());
+    const monthSet = new Set();
+    for (const row of monthly) {
+      if (!kwMonthlyData[row.search_query]) kwMonthlyData[row.search_query] = [];
+      kwMonthlyData[row.search_query].push(row);
+      monthSet.add(row.month);
+    }
+    kwAllMonths = [...monthSet].sort();
+  }
+
+  // Fetch strategy/keyword_type from keyword_targets (existing endpoint)
+  const ktData = await fetch('/api/keywords?limit=5000').then(r => r.json());
+  _adsStrategyByTerm = {};
+  _adsKwTypeByTerm = {};
+  ktData.forEach(r => {
+    const t = (r.search_query || '').toLowerCase();
+    _adsStrategyByTerm[t] = r.strategy || null;
+    _adsKwTypeByTerm[t] = r.keyword_type || null;
+  });
+
+  // Fetch monthly ad data + monthly summary + revenue in parallel
+  const [adsMonthly, summaryMonthly, revData] = await Promise.all([
+    fetch('/api/ads/keywords/monthly').then(r => r.json()),
+    fetch('/api/ads/summary/monthly').then(r => r.json()),
+    fetch('/api/revenue-by-month').then(r => r.json()),
+  ]);
+
+  // Build monthly ad data lookup by term
+  _adsMonthlyByTerm = {};
+  const adsMonthSet = new Set();
+  for (const row of adsMonthly) {
+    if (!_adsMonthlyByTerm[row.search_term]) _adsMonthlyByTerm[row.search_term] = [];
+    _adsMonthlyByTerm[row.search_term].push(row);
+    adsMonthSet.add(row.month);
+  }
+  _adsAllMonths = [...adsMonthSet].sort();
+
+  _adsSummaryMonthly = summaryMonthly;
+
+  _monthlyRevenue = {};
+  revData.forEach(r => { _monthlyRevenue[r.month] = r.revenue || 0; });
+
+  _initAdsHorizons();
+  recomputeAdsOrganic();
+  recomputeAdsSummary();
+  filterAdsKeywords();
+}
+
+function filterAdsKeywords() {
+  const search = (document.getElementById('ads-kw-search')?.value || '').toLowerCase();
+  const stratEl = document.querySelector('#ads-strategy-chips .chip.active');
+  const strategy = stratEl ? stratEl.dataset.adstrat : 'All';
+  const typeEl = document.querySelector('#ads-adtype-chips .chip.active');
+  const adType = typeEl ? typeEl.dataset.adtype : 'All';
+  const minClicks = parseInt(document.getElementById('ads-clicks-filter')?.value || '0', 10);
+  const minSqpClicks = parseInt(document.getElementById('sqp-clicks-filter')?.value || '0', 10);
+
+  const filtered = _adsKwData.filter(r => {
+    if (search && !(r.search_term||'').toLowerCase().includes(search)) return false;
+    if (strategy !== 'All') {
+      if (strategy === '') { if (r.strategy) return false; }
+      else { if (r.strategy !== strategy) return false; }
+    }
+    if (adType !== 'All' && !(r.ad_type_list||'').includes(adType)) return false;
+    if (minClicks > 0 && (r.ad_clicks || 0) < minClicks) return false;
+    if (minSqpClicks > 0 && (r.sqp_brand_clicks || 0) < minSqpClicks) return false;
+    return true;
+  });
+
+  // Client-side sort
+  filtered.sort((a, b) => {
+    let av = a[adsSortCol], bv = b[adsSortCol];
+    if (av == null) av = adsSortDir === -1 ? -Infinity : Infinity;
+    if (bv == null) bv = adsSortDir === -1 ? -Infinity : Infinity;
+    if (typeof av === 'string') return adsSortDir * av.localeCompare(bv);
+    return adsSortDir * (av - bv);
+  });
+
+  document.getElementById('ads-filter-count').textContent = `${filtered.length} of ${_adsKwData.length}`;
+
+  function acosFmt(v) {
+    if (v == null) return '--';
+    const pct = (v * 100).toFixed(1);
+    const color = v <= 0.20 ? 'var(--green)' : v <= 0.35 ? 'var(--yellow)' : 'var(--red)';
+    return `<span style="color:${color};font-weight:600">${pct}%</span>`;
+  }
+
+  document.getElementById('ads-kw-tbody').innerHTML = filtered.map(r => `
+    <tr class="kw-row" style="cursor:pointer" onclick="drillAdsKeyword('${(r.search_term||'').replace(/'/g,"\\'")}',this)">
+      <td>${r.search_term||''}</td>
+      <td><span style="color:var(--muted);font-size:0.72rem">${r.ad_type_list||''}</span></td>
+      <td class="num">${r.ad_spend!=null?fmt$(r.ad_spend):'--'}</td>
+      <td class="num">${r.ad_clicks!=null?fmtN(r.ad_clicks):'--'}</td>
+      <td class="num">${r.ad_sales!=null?fmt$(r.ad_sales):'--'}</td>
+      <td class="num">${acosFmt(r.ad_acos)}</td>
+      <td class="num">${r.ad_roas!=null?`<span style="font-weight:600">${r.ad_roas.toFixed(2)}x</span>`:'--'}</td>
+      <td class="num">${r.num_campaigns||''}</td>
+      <td class="num">${r.best_impression_share!=null?r.best_impression_share.toFixed(1)+'%':'--'}</td>
+      <td>${strategyBadge(r.strategy)}</td>
+      <td class="num">${r.organic_volume!=null?fmtN(r.organic_volume):'--'}</td>
+      <td class="num">${r.organic_units!=null?fmtN(r.organic_units):'--'}</td>
+      <td class="num">${cvrIndexFmt(r.cvr_index)}</td>
+    </tr>
+  `).join('');
+
+  // Attach header sort handlers
+  document.querySelectorAll('#ads-kw-table th[data-adcol]').forEach(th => {
+    th.style.cursor = 'pointer';
+    th.onclick = () => sortAdsTable(th.dataset.adcol);
+  });
+
+  // Hide drill-downs when filtering
+  document.getElementById('ads-product-detail').classList.remove('visible');
+  document.getElementById('ads-campaign-detail').classList.remove('visible');
+}
+
+async function drillAdsKeyword(term, rowEl) {
+  _adsCurrentTerm = term;
+  document.querySelectorAll('#ads-kw-table .kw-row').forEach(r => r.classList.remove('kw-row-selected'));
+  if (rowEl) rowEl.classList.add('kw-row-selected');
+
+  const panel = document.getElementById('ads-product-detail');
+  document.getElementById('ads-product-header').textContent = `ASINs bidding on: "${term}"`;
+  panel.classList.add('visible');
+  document.getElementById('ads-campaign-detail').classList.remove('visible');
+
+  const res = await fetch(`/api/ads/keyword/${encodeURIComponent(term)}/products`);
+  const data = await res.json();
+
+  function roleBadge(role) {
+    if (!role) return '--';
+    const colors = {core:'var(--green)',supporting:'var(--blue)',opportunistic:'var(--yellow)'};
+    return `<span style="color:${colors[role]||'var(--muted)'};font-size:0.72rem;font-weight:600">${role}</span>`;
+  }
+
+  document.getElementById('ads-product-tbody').innerHTML = data.length ? data.map(r => `
+    <tr class="kw-row" style="cursor:pointer" onclick="drillAdsCampaigns('${(term).replace(/'/g,"\\'")}','${r.asin}',this)">
+      <td><span class="asin-link">${r.asin||''}</span></td>
+      <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+          title="${(r.product_name||'').replace(/"/g,'&quot;')}">${r.product_name||'--'}</td>
+      <td class="num">${r.ad_spend!=null?fmt$(r.ad_spend):'--'}</td>
+      <td class="num">${r.ad_sales!=null?fmt$(r.ad_sales):'--'}</td>
+      <td class="num">${r.ad_acos!=null?`<span style="color:${r.ad_acos<=0.20?'var(--green)':r.ad_acos<=0.35?'var(--yellow)':'var(--red)'};font-weight:600">${(r.ad_acos*100).toFixed(1)}%</span>`:'--'}</td>
+      <td class="num">${r.num_campaigns||''}</td>
+      <td>${roleBadge(r.keyword_role)}</td>
+      <td class="num">${r.organic_purchase_share!=null?fmtP(r.organic_purchase_share*100):'--'}</td>
+      <td class="num">${cvrIndexFmt(r.cvr_index)}</td>
+    </tr>
+  `).join('') : '<tr><td colspan="9" style="text-align:center;color:var(--dim)">No ASIN-level data</td></tr>';
+  panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+async function drillAdsCampaigns(term, asin, rowEl) {
+  document.querySelectorAll('#ads-product-table .kw-row').forEach(r => r.classList.remove('kw-row-selected'));
+  if (rowEl) rowEl.classList.add('kw-row-selected');
+
+  const panel = document.getElementById('ads-campaign-detail');
+  document.getElementById('ads-campaign-header').textContent = `Campaigns: "${term}" \u2192 ${asin}`;
+  panel.classList.add('visible');
+
+  const res = await fetch(`/api/ads/keyword/${encodeURIComponent(term)}/product/${asin}/campaigns`);
+  const data = await res.json();
+
+  document.getElementById('ads-campaign-tbody').innerHTML = data.length ? data.map(r => `
+    <tr>
+      <td style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+          title="${(r.campaign_name||'').replace(/"/g,'&quot;')}">${r.campaign_name||''}</td>
+      <td><span style="color:var(--muted);font-size:0.72rem">${r.ad_type||''}</span></td>
+      <td><span style="color:var(--muted);font-size:0.72rem">${r.match_type||'--'}</span></td>
+      <td class="num">${r.spend!=null?fmt$(r.spend):'--'}</td>
+      <td class="num">${r.cpc!=null?'$'+r.cpc.toFixed(2):'--'}</td>
+      <td class="num">${r.clicks!=null?fmtN(r.clicks):'--'}</td>
+      <td class="num">${r.orders!=null?fmtN(r.orders):'--'}</td>
+      <td class="num">${r.acos!=null?`<span style="color:${r.acos<=0.20?'var(--green)':r.acos<=0.35?'var(--yellow)':'var(--red)'};font-weight:600">${(r.acos*100).toFixed(1)}%</span>`:'--'}</td>
+      <td class="num">${r.impression_share!=null?r.impression_share.toFixed(1)+'%':'--'}</td>
+    </tr>
+  `).join('') : '<tr><td colspan="9" style="text-align:center;color:var(--dim)">No campaign data found</td></tr>';
+  panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
 loaded['overview'] = true;
 loadOverview();
 </script>
@@ -3355,5 +4155,6 @@ def index():
 
 
 if __name__ == "__main__":
-    print("Nire Beauty Analytics Dashboard -> http://localhost:5050")
-    app.run(host="0.0.0.0", port=5050, debug=True)
+    port = int(os.environ.get("PORT", 5052))
+    print(f"Nire Beauty Analytics Dashboard -> http://localhost:{port}")
+    app.run(host="0.0.0.0", port=port, debug=True)

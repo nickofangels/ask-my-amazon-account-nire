@@ -187,6 +187,7 @@ CATALOG_PERF_DIR = RAW_DIR / "search_catalog_performance"
 MARKET_BASKET_DIR = RAW_DIR / "market_basket"
 REPEAT_PURCHASE_DIR = RAW_DIR / "repeat_purchase"
 LISTINGS_TSV = RAW_DIR / "listings" / "listings.tsv"
+ADS_DIR = RAW_DIR / "ads"
 
 
 if __name__ == "__main__":

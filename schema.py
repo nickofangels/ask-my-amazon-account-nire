@@ -321,6 +321,297 @@ TABLES = [
         PRIMARY KEY (data_type, month)
     )
     """,
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Tier 4 — Advertising tables (loaded from Excel/CSV by db/load_ads.py)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    # ── Ad Campaigns (SP Campaign + SP Budget + SB Campaign + SD Campaign) ───
+    """
+    CREATE TABLE IF NOT EXISTS ads_campaigns (
+        month                   TEXT NOT NULL,
+        ad_type                 TEXT NOT NULL,
+        campaign_name           TEXT NOT NULL,
+        attribution_window      TEXT,
+        status                  TEXT,
+        portfolio_name          TEXT,
+        budget                  DOUBLE PRECISION,
+        spend                   DOUBLE PRECISION,
+        impressions             INTEGER,
+        clicks                  INTEGER,
+        ctr                     DOUBLE PRECISION,
+        cpc                     DOUBLE PRECISION,
+        orders                  INTEGER,
+        units                   INTEGER,
+        sales                   DOUBLE PRECISION,
+        acos                    DOUBLE PRECISION,
+        roas                    DOUBLE PRECISION,
+        cvr                     DOUBLE PRECISION,
+        bidding_strategy        TEXT,
+        targeting_type          TEXT,
+        recommended_budget      DOUBLE PRECISION,
+        avg_time_in_budget      DOUBLE PRECISION,
+        est_missed_imp_lower    DOUBLE PRECISION,
+        est_missed_imp_upper    DOUBLE PRECISION,
+        est_missed_clicks_lower DOUBLE PRECISION,
+        est_missed_clicks_upper DOUBLE PRECISION,
+        est_missed_sales_lower  DOUBLE PRECISION,
+        est_missed_sales_upper  DOUBLE PRECISION,
+        ntb_orders              INTEGER,
+        ntb_sales               DOUBLE PRECISION,
+        ntb_units               INTEGER,
+        ntb_order_pct           DOUBLE PRECISION,
+        ntb_sales_pct           DOUBLE PRECISION,
+        branded_searches        INTEGER,
+        dpv                     INTEGER,
+        video_complete_views    INTEGER,
+        video_completion_rate   DOUBLE PRECISION,
+        pulled_at               TEXT NOT NULL,
+        PRIMARY KEY (month, ad_type, campaign_name)
+    )
+    """,
+
+    # ── Ad Search Terms (SP + SB search term + impression share merged) ──────
+    """
+    CREATE TABLE IF NOT EXISTS ads_search_terms (
+        month                   TEXT NOT NULL,
+        ad_type                 TEXT NOT NULL,
+        campaign_name           TEXT NOT NULL,
+        ad_group_name           TEXT NOT NULL DEFAULT '',
+        targeting_text          TEXT NOT NULL DEFAULT '',
+        match_type              TEXT,
+        customer_search_term    TEXT NOT NULL,
+        attribution_window      TEXT,
+        impressions             INTEGER,
+        clicks                  INTEGER,
+        ctr                     DOUBLE PRECISION,
+        cpc                     DOUBLE PRECISION,
+        spend                   DOUBLE PRECISION,
+        orders                  INTEGER,
+        units                   INTEGER,
+        sales                   DOUBLE PRECISION,
+        acos                    DOUBLE PRECISION,
+        roas                    DOUBLE PRECISION,
+        cvr                     DOUBLE PRECISION,
+        impression_rank         INTEGER,
+        impression_share        DOUBLE PRECISION,
+        own_sku_units           INTEGER,
+        own_sku_sales           DOUBLE PRECISION,
+        other_sku_units         INTEGER,
+        other_sku_sales         DOUBLE PRECISION,
+        pulled_at               TEXT NOT NULL,
+        PRIMARY KEY (month, ad_type, campaign_name, ad_group_name,
+                     targeting_text, customer_search_term)
+    )
+    """,
+
+    # ── Ad Targeting (SP Targeting + SB Keyword + SD Targeting + SP Audience) ─
+    """
+    CREATE TABLE IF NOT EXISTS ads_targeting (
+        month                   TEXT NOT NULL,
+        ad_type                 TEXT NOT NULL,
+        campaign_name           TEXT NOT NULL,
+        ad_group_name           TEXT NOT NULL DEFAULT '',
+        targeting_text          TEXT NOT NULL,
+        match_type              TEXT NOT NULL DEFAULT '',
+        attribution_window      TEXT,
+        targeting_type          TEXT,
+        impressions             INTEGER,
+        clicks                  INTEGER,
+        ctr                     DOUBLE PRECISION,
+        cpc                     DOUBLE PRECISION,
+        spend                   DOUBLE PRECISION,
+        orders                  INTEGER,
+        units                   INTEGER,
+        sales                   DOUBLE PRECISION,
+        acos                    DOUBLE PRECISION,
+        roas                    DOUBLE PRECISION,
+        cvr                     DOUBLE PRECISION,
+        top_of_search_imp_share DOUBLE PRECISION,
+        own_sku_units           INTEGER,
+        own_sku_sales           DOUBLE PRECISION,
+        other_sku_units         INTEGER,
+        other_sku_sales         DOUBLE PRECISION,
+        ntb_orders              INTEGER,
+        ntb_sales               DOUBLE PRECISION,
+        branded_searches        INTEGER,
+        pulled_at               TEXT NOT NULL,
+        PRIMARY KEY (month, ad_type, campaign_name, ad_group_name,
+                     targeting_text, match_type)
+    )
+    """,
+
+    # ── Ad Products (SP + SD Advertised Product) ─────────────────────────────
+    """
+    CREATE TABLE IF NOT EXISTS ads_products (
+        month                   TEXT NOT NULL,
+        ad_type                 TEXT NOT NULL,
+        campaign_name           TEXT NOT NULL,
+        ad_group_name           TEXT NOT NULL DEFAULT '',
+        asin                    TEXT NOT NULL,
+        sku                     TEXT,
+        attribution_window      TEXT,
+        impressions             INTEGER,
+        clicks                  INTEGER,
+        ctr                     DOUBLE PRECISION,
+        cpc                     DOUBLE PRECISION,
+        spend                   DOUBLE PRECISION,
+        orders                  INTEGER,
+        units                   INTEGER,
+        sales                   DOUBLE PRECISION,
+        acos                    DOUBLE PRECISION,
+        roas                    DOUBLE PRECISION,
+        cvr                     DOUBLE PRECISION,
+        own_sku_units           INTEGER,
+        own_sku_sales           DOUBLE PRECISION,
+        other_sku_units         INTEGER,
+        other_sku_sales         DOUBLE PRECISION,
+        ntb_orders              INTEGER,
+        ntb_sales               DOUBLE PRECISION,
+        ntb_units               INTEGER,
+        dpv                     INTEGER,
+        pulled_at               TEXT NOT NULL,
+        PRIMARY KEY (month, ad_type, campaign_name, ad_group_name, asin)
+    )
+    """,
+
+    # ── Ad Placements (SP Placement + SB Campaign/Keyword Placement) ─────────
+    """
+    CREATE TABLE IF NOT EXISTS ads_placements (
+        month                   TEXT NOT NULL,
+        ad_type                 TEXT NOT NULL,
+        campaign_name           TEXT NOT NULL,
+        placement               TEXT NOT NULL,
+        targeting_text          TEXT NOT NULL DEFAULT '',
+        match_type              TEXT NOT NULL DEFAULT '',
+        attribution_window      TEXT,
+        impressions             INTEGER,
+        clicks                  INTEGER,
+        ctr                     DOUBLE PRECISION,
+        cpc                     DOUBLE PRECISION,
+        spend                   DOUBLE PRECISION,
+        orders                  INTEGER,
+        units                   INTEGER,
+        sales                   DOUBLE PRECISION,
+        acos                    DOUBLE PRECISION,
+        roas                    DOUBLE PRECISION,
+        ntb_orders              INTEGER,
+        ntb_sales               DOUBLE PRECISION,
+        branded_searches        INTEGER,
+        video_complete_views    INTEGER,
+        pulled_at               TEXT NOT NULL,
+        PRIMARY KEY (month, ad_type, campaign_name, placement,
+                     targeting_text, match_type)
+    )
+    """,
+
+    # ── Ad Purchased Products (SP halo/cross-sell) ───────────────────────────
+    """
+    CREATE TABLE IF NOT EXISTS ads_purchased_products (
+        month                   TEXT NOT NULL,
+        campaign_name           TEXT NOT NULL,
+        ad_group_name           TEXT NOT NULL DEFAULT '',
+        advertised_asin         TEXT NOT NULL,
+        purchased_asin          TEXT NOT NULL,
+        targeting_text          TEXT NOT NULL DEFAULT '',
+        match_type              TEXT,
+        other_sku_units         INTEGER,
+        other_sku_orders        INTEGER,
+        other_sku_sales         DOUBLE PRECISION,
+        pulled_at               TEXT NOT NULL,
+        PRIMARY KEY (month, campaign_name, advertised_asin,
+                     purchased_asin, targeting_text)
+    )
+    """,
+
+    # ── Ad Benchmarks (cross-channel + SB category benchmark) ────────────────
+    """
+    CREATE TABLE IF NOT EXISTS ads_benchmarks (
+        month                   TEXT NOT NULL,
+        ad_type                 TEXT NOT NULL,
+        category                TEXT NOT NULL DEFAULT '',
+        brand                   TEXT NOT NULL DEFAULT '',
+        metric_name             TEXT NOT NULL,
+        your_value              DOUBLE PRECISION,
+        p25                     DOUBLE PRECISION,
+        p50                     DOUBLE PRECISION,
+        p75                     DOUBLE PRECISION,
+        peer_set_size           INTEGER,
+        pulled_at               TEXT NOT NULL,
+        PRIMARY KEY (month, ad_type, category, brand, metric_name)
+    )
+    """,
+
+    # ── Ad Invalid Traffic (SP + SB + SD gross/invalid traffic) ──────────────
+    """
+    CREATE TABLE IF NOT EXISTS ads_invalid_traffic (
+        month                   TEXT NOT NULL,
+        ad_type                 TEXT NOT NULL,
+        campaign_name           TEXT NOT NULL,
+        gross_impressions       INTEGER,
+        impressions             INTEGER,
+        invalid_impressions     INTEGER,
+        invalid_impression_rate DOUBLE PRECISION,
+        gross_clicks            INTEGER,
+        clicks                  INTEGER,
+        invalid_clicks          INTEGER,
+        invalid_click_rate      DOUBLE PRECISION,
+        pulled_at               TEXT NOT NULL,
+        PRIMARY KEY (month, ad_type, campaign_name)
+    )
+    """,
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Tier 5 — Content optimization (built by db/build_content_briefs.py
+    #          and db/build_listing_recommendations.py)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    # ── Content Briefs (tiered keywords per ASIN) ────────────────────────────
+    """
+    CREATE TABLE IF NOT EXISTS content_briefs (
+        asin                TEXT NOT NULL,
+        search_query        TEXT NOT NULL,
+        content_brief_score DOUBLE PRECISION,
+        content_tier        TEXT NOT NULL,
+        tier_rank           INTEGER NOT NULL,
+        search_volume       INTEGER,
+        keyword_relevance   DOUBLE PRECISION,
+        keyword_role        TEXT,
+        keyword_type        TEXT,
+        strategy            TEXT,
+        cvr_index           DOUBLE PRECISION,
+        click_share         DOUBLE PRECISION,
+        purchase_share      DOUBLE PRECISION,
+        revenue_score       DOUBLE PRECISION,
+        headroom_pct        DOUBLE PRECISION,
+        momentum_pct        DOUBLE PRECISION,
+        share_trend         DOUBLE PRECISION,
+        built_at            TEXT NOT NULL,
+        PRIMARY KEY (asin, search_query)
+    )
+    """,
+
+    # ── Listing Recommendations (generated copy per ASIN) ────────────────────
+    """
+    CREATE TABLE IF NOT EXISTS listing_recommendations (
+        asin                    TEXT NOT NULL PRIMARY KEY,
+        rec_title               TEXT,
+        rec_title_chars         INTEGER,
+        rec_bullets             TEXT,
+        rec_description         TEXT,
+        rec_description_chars   INTEGER,
+        rec_backend_terms       TEXT,
+        rec_qa_seeds            TEXT,
+        title_keywords_used     INTEGER,
+        title_keywords_total    INTEGER,
+        bullet_keywords_used    INTEGER,
+        bullet_keywords_total   INTEGER,
+        total_volume_covered    INTEGER,
+        total_volume_available  INTEGER,
+        current_title           TEXT,
+        built_at                TEXT NOT NULL
+    )
+    """,
 ]
 
 
@@ -377,6 +668,40 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_kt_strategy ON keyword_targets (strategy)",
     "CREATE INDEX IF NOT EXISTS idx_kt_volume   ON keyword_targets (volume)",
     "CREATE INDEX IF NOT EXISTS idx_kt_cvr_idx  ON keyword_targets (cvr_index)",
+
+    # Ads — Search Terms (main join key to organic data)
+    "CREATE INDEX IF NOT EXISTS idx_ast_term    ON ads_search_terms (customer_search_term)",
+    "CREATE INDEX IF NOT EXISTS idx_ast_month   ON ads_search_terms (month)",
+    "CREATE INDEX IF NOT EXISTS idx_ast_adtype  ON ads_search_terms (ad_type)",
+    "CREATE INDEX IF NOT EXISTS idx_ast_camp    ON ads_search_terms (campaign_name)",
+
+    # Ads — Campaigns
+    "CREATE INDEX IF NOT EXISTS idx_ac_month    ON ads_campaigns (month)",
+    "CREATE INDEX IF NOT EXISTS idx_ac_adtype   ON ads_campaigns (ad_type)",
+
+    # Ads — Targeting
+    "CREATE INDEX IF NOT EXISTS idx_at_month    ON ads_targeting (month)",
+    "CREATE INDEX IF NOT EXISTS idx_at_target   ON ads_targeting (targeting_text)",
+
+    # Ads — Products
+    "CREATE INDEX IF NOT EXISTS idx_ap_month    ON ads_products (month)",
+    "CREATE INDEX IF NOT EXISTS idx_ap_asin     ON ads_products (asin)",
+
+    # Ads — Placements
+    "CREATE INDEX IF NOT EXISTS idx_apl_month   ON ads_placements (month)",
+    "CREATE INDEX IF NOT EXISTS idx_apl_place   ON ads_placements (placement)",
+
+    # Ads — Purchased Products
+    "CREATE INDEX IF NOT EXISTS idx_app_advasin ON ads_purchased_products (advertised_asin)",
+    "CREATE INDEX IF NOT EXISTS idx_app_purasin ON ads_purchased_products (purchased_asin)",
+
+    # Content Briefs
+    "CREATE INDEX IF NOT EXISTS idx_cb_asin     ON content_briefs (asin)",
+    "CREATE INDEX IF NOT EXISTS idx_cb_tier     ON content_briefs (content_tier)",
+    "CREATE INDEX IF NOT EXISTS idx_cb_query    ON content_briefs (search_query)",
+
+    # Listing Recommendations
+    "CREATE INDEX IF NOT EXISTS idx_lr_asin     ON listing_recommendations (asin)",
 ]
 
 
